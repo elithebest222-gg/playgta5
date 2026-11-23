@@ -40,6 +40,23 @@ let parentPort = null;
 if (isNode) parentPort = require('worker_threads').parentPort;
 
 function post(msg) { if (parentPort) parentPort.postMessage(msg); else self.postMessage(msg); }
+// The player's own folder (index.html on GitHub Pages): loader.js sends { localFiles: { prefix, files: Map name -> File, dir } } before the engine starts this worker.
+// A fetch of a URL under `prefix` (the build's shaders folder: index.json, the pipeline seeds, the packs, single shaders) is then answered from those Files (or
+// looked up in `dir`, a directory handle, when the name is not in the map); nothing of it goes to the network.
+let localFiles = null;
+if (!isNode) {
+	const netFetch = self.fetch.bind(self);
+	self.fetch = async (url, init) => {
+		const lf = localFiles, u = typeof url === 'string' ? url : url && url.url;
+		if (!lf || !u || !u.startsWith(lf.prefix)) return netFetch(url, init);
+		const name = decodeURIComponent(u.slice(lf.prefix.length).split(/[?#]/)[0]);
+		let file = lf.files.get(name) || null;
+		if (!file && lf.dir && !name.includes('/')) {
+			try { file = await (await lf.dir.getFileHandle(name)).getFile(); lf.files.set(name, file); } catch (e) { /* not in the folder */ }
+		}
+		return file ? new Response(file) : new Response(null, { status: 404, statusText: 'Not Found' });
+	};
+}
 // fs.writeSync: process.stderr in a worker is proxied through the main thread, whose event loop the blocked game never runs
 function logLine(s) {
 	if (isNode) { require('fs').writeSync(2, '[wgpu] ' + s + '\n'); return; }
@@ -2965,5 +2982,8 @@ if (!isNode) {
 	self.postMessage({ loaded: true });		// loader.js waits for this before it starts the engine (see there)
 }
 if (isNode && parentPort) parentPort.on('message', (m) => { start(m); });
-else if (!isNode) self.onmessage = (ev) => { start(ev.data); };
+else if (!isNode) self.onmessage = (ev) => {
+	if (ev.data && ev.data.localFiles) { localFiles = ev.data.localFiles; return; }		// loader.js, before the start message (see the fetch above)
+	start(ev.data);
+};
 if (typeof module !== 'undefined') module.exports = { packUniforms, parseWgsl };
