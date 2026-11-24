@@ -147,6 +147,7 @@ const errorKinds = new Map();		// normalised message -> { n, msg }
 function dumpErrors() { for (const [k, e] of [...errorKinds].sort((a, b) => b[1].n - a[1].n).slice(0, 15)) logLine('  error x' + e.n + ': ' + e.msg.slice(0, 300)); }
 let drawCount = 0, skippedDraws = 0;
 let lastPresentDraws = 0, progressChannel = null, worldSent = false;
+let lastFitPl = '';		// the shader pair of the last draw that needed texture-limit variants (fitTextures): a change forces a pipeline lookup
 let worldSince = 0, worldClean = 0, worldSkips0 = 0, worldNoteT = 0, skipsAtPresent = 0;		// present(): the title screen stays up until frames stop skipping draws
 // id -> object (texture, buffer, shader, layout, srv, state); ids are unique across kinds. Ids come from one counter in wgpu_backend.cpp (AllocId) and are never reused, so a plain
 // array indexed by id holds them (dense, small gaps): a draw looks up ~15 objects, and an element load is several times cheaper than Map.get.
@@ -275,6 +276,12 @@ function parseWgsl(text) {
 		const all = text.match(new RegExp('\\b' + b.name + '\\b', 'g')) || [];
 		const loads = text.match(new RegExp('\\b(?:textureLoad|textureDimensions|textureNumLevels|textureNumLayers)\\s*\\(\\s*' + b.name + '\\b', 'g')) || [];
 		b.loadOnly = loads.length > 0 && loads.length === all.length - 1;
+	}
+	for (const b of bindings) {
+		if (b.kind !== 'texture') continue;
+		const all = text.match(new RegExp('\\b' + b.name + '\\b', 'g')) || [];
+		const calls = (text.match(texCallRe(b.name)) || []).length;
+		b.droppable = calls === all.length - 1;		// every mention but the declaration is a builtin call on it (one passed to a helper function is kept)
 	}
 	// fragment outputs: locations of the return value of `fn main`
 	const outputs = [];
@@ -499,8 +506,70 @@ function shaderProgram(sh) {
 	for (const b of info.bindings) (groupBindings[b.group] || (groupBindings[b.group] = [])).push(b);
 	for (const g in groupBindings) groupBindings[g].sort((a, b) => a.binding - b.binding);
 	// vid/iid: the shader reads vertex_index / instance_index (doDraw folds the draw's start into the buffer offsets only for those: 6 and 93 of ~4,800 shaders)
-	sh.program = { module, info, consts, pack, text, flat, groupBindings, variants: new Map(), bgls: [], label: rec.effect + '::' + rec.program, vid: /\bvertex_index\b/.test(text), iid: /\binstance_index\b/.test(text) };
+	const overTex = info.bindings.filter((b) => b.kind === 'texture').length - (device.limits.maxSampledTexturesPerShaderStage || 16);		// see fitTextures
+	sh.program = { module, info, consts, pack, text, flat, groupBindings, variants: new Map(), bgls: [], label: rec.effect + '::' + rec.program, vid: /\bvertex_index\b/.test(text), iid: /\binstance_index\b/.test(text), overTex: Math.max(0, overTex) };
 	return sh.program;
+}
+
+// ---- shaders with more textures than the device allows per stage ---------------------------------------------------------------------------------------
+// D3D11 allows 128 textures per shader stage; WebGPU devices may allow as few as 16 (Chromebook GPUs do), and some of the game's shaders read up to 22. Their bind
+// group layout cannot be made and every draw with them is lost. Such a shader runs as a variant compiled without some of its textures, each read replaced by
+// the value an empty D3D11 slot gives (zeros): first the slots this draw leaves empty (exact: the shader reads zeros from them anyway), and only if that is not
+// enough the highest-numbered bound ones (approximate; noted on the page once). A variant is its own shader object and program, so pipelines and bind groups
+// are cached for it as for any other.
+const TEX_CALL = '\\b(?:textureSample\\w*|textureLoad|textureDimensions|textureNumLevels|textureNumLayers|textureNumSamples|textureGather\\w*)\\s*\\(\\s*';
+function texCallRe(name) { return new RegExp(TEX_CALL + '(?:(?<=textureGather\\w*\\s*\\(\\s*)[\\w.]+\\s*,\\s*)?' + name + '\\b', 'g'); }
+// the program's text without texture binding b: its declaration removed, each builtin call on it replaced by an empty slot's value (zeros) of the call's type
+function dropTexture(text, b) {
+	text = text.replace(new RegExp('@group\\(\\d+u?\\)\\s*@binding\\(' + b.binding + 'u?\\)\\s*var\\s+' + b.name + '\\s*:[^;]*;'), '');
+	const scalar = b.sample === 'uint' ? 'u32' : b.sample === 'sint' ? 'i32' : 'f32', zero = scalar === 'u32' ? '0u' : scalar === 'i32' ? '0i' : '0.0';
+	const value = (fn) => (fn === 'textureDimensions' ? (b.dim === '1d' ? '0u' : b.dim === '3d' ? 'vec3<u32>(0u)' : 'vec2<u32>(0u)')
+		: fn.startsWith('textureNum') ? '0u'
+		: fn.startsWith('textureGather') || b.sample !== 'depth' ? 'vec4<' + scalar + '>(' + zero + ')' : '0.0');		// depth: textureSample/Load/Compare give f32
+	const re = texCallRe(b.name);
+	let out = '', last = 0, m;
+	while ((m = re.exec(text))) {
+		const fn = /^\w+/.exec(m[0])[0], open = text.indexOf('(', m.index);
+		let i = open + 1, depth = 1;
+		while (i < text.length && depth) { const c = text[i++]; if (c === '(') depth++; else if (c === ')') depth--; }
+		out += text.slice(last, m.index) + value(fn);
+		last = i;
+		re.lastIndex = i;
+	}
+	return out + text.slice(last);
+}
+// The variant of program prog (of shader object obj, at stage) for the textures bound now: { obj, prog }, or null when it cannot be made to fit
+function fitTextures(obj, prog, stage) {
+	const limit = device.limits.maxSampledTexturesPerShaderStage || 16;
+	const texs = prog.info.bindings.filter((b) => b.kind === 'texture'), need = texs.length - limit;
+	const isBound = (b) => { const id = S.srv[stage][b.binding - 32], srv = id ? objs.get(id) : null, t = srv && !srv.isBuf ? objs.get(srv.res) : null; return !!(t && t.kind === 'texture'); };
+	const byHigh = (a, b) => b.binding - a.binding;
+	const empty = texs.filter((b) => b.droppable && !isBound(b)).sort(byHigh);
+	let drop = empty.slice(0, need), lossy = [];
+	if (drop.length < need) {
+		lossy = texs.filter((b) => b.droppable && isBound(b)).sort(byHigh).slice(0, need - drop.length);
+		drop = drop.concat(lossy);
+	}
+	if (drop.length < need) { logOnce('fit' + prog.label, 'shader ' + prog.label + ' reads ' + texs.length + ' textures (this GPU allows ' + limit + ') and cannot be reduced: its draws are skipped'); return null; }
+	drop.sort((a, b) => a.binding - b.binding);
+	const key = drop.map((b) => b.binding).join(',');
+	const cache = prog.texVariants || (prog.texVariants = new Map());
+	let v = cache.get(key);
+	if (v) return v;
+	let text = prog.text;
+	for (const b of drop) text = dropTexture(text, b);
+	const bindings = prog.info.bindings.filter((b) => !drop.includes(b)), groupBindings = {};
+	for (const b of bindings) (groupBindings[b.group] || (groupBindings[b.group] = [])).push(b);
+	for (const g in groupBindings) groupBindings[g].sort((a, b) => a.binding - b.binding);
+	const label = prog.label + ' (without t' + drop.map((b) => b.binding - 32).join(',t') + ')';
+	shaderModuleCount++;
+	const vprog = { module: device.createShaderModule({ code: text, label }), info: { ...prog.info, bindings }, consts: prog.consts, pack: prog.pack, text, flat: prog.flat, groupBindings,
+		variants: new Map(), bgls: [], label, vid: prog.vid, iid: prog.iid, overTex: 0 };
+	v = { obj: { kind: 'shader', stage: obj.stage, hash: obj.hash + '~' + key, sig: obj.sig, program: vprog, fetched: obj.fetched, variantOf: obj }, prog: vprog };
+	cache.set(key, v);
+	logLine('shader ' + prog.label + ' reads ' + texs.length + ' textures, this GPU allows ' + limit + ': variant without ' + drop.map((b) => 't' + (b.binding - 32) + (lossy.includes(b) ? ' (bound)' : '')).join(', '));
+	if (lossy.length && !isNode) (gpuErrorChannel || (gpuErrorChannel = new BroadcastChannel('game-progress'))).postMessage({ gpuError: 'shader ' + prog.label + ' needs ' + texs.length + ' textures, this GPU allows ' + limit + ': ' + lossy.length + ' left out (some detail may be missing)', kinds: 'note', total: 0 });
+	return v;
 }
 const STAGE_NAME = ['vs', 'ps', 'cs'];
 
@@ -1302,7 +1371,7 @@ function getPipeline(vsObj, psObj, vsProg, psProg, layout, rtInfo, dsFormat) {
 		c.waiters.push(bucket, bucket.length - 1);
 		return PIPELINE_PENDING;
 	}
-	recordRecipe(rc, key);
+	if (!vsObj.variantOf && !(psObj && psObj.variantOf)) recordRecipe(rc, key);		// a texture-limit variant (fitTextures) has no shader of its own to find next time
 	const { desc, vbReq } = pipelineDescFor(vsObj, psObj, vsProg, psProg, layout, strides, S.topo, stripFmt, blendState, dss, rs, rtInfo, dsFormat, passInfoNow.roDepth, passInfoNow.roStencil);
 	contentPipelines.set(key, c = { p: undefined, waiters: [], ahead: false });
 	pipeCreates++;
@@ -1434,6 +1503,7 @@ function compileAhead(rc, key) {
 	if (!isNode && (vsObj.fetched === undefined || (psObj && psObj.fetched === undefined))) return 'later';		// shaderProgram must not run before the fetch: it would cache a failure
 	const vsProg = shaderProgram(vsObj), psProg = psObj ? shaderProgram(psObj) : null;
 	if (!vsProg || (psObj && !psProg)) return 'done';
+	if (vsProg.overTex || (psProg && psProg.overTex)) return 'done';		// over this device's texture limit: compiled per draw as variants (fitTextures)
 	const els = rc.el.map(([sem, idx, fmt, slot, offset, cls, rate]) => ({ sem, idx, fmt, slot, offset, cls, rate }));
 	const layout = { kind: 'layout', els, slots: layoutSlots(els) };
 	const strides = new Array(16).fill(0);
@@ -1824,14 +1894,21 @@ function doDraw(p) {
 		dbgFrameDraw++;
 	}
 	const kind = u32[p], count = u32[p + 1], inst = u32[p + 2], start = u32[p + 3], baseVertex = u32[p + 4] | 0, startInstance = u32[p + 5];
-	const vsObj = S.shader[0] ? objs.get(S.shader[0]) : null;
+	let vsObj = S.shader[0] ? objs.get(S.shader[0]) : null;
 	if (!vsObj) { skipDraw('if (!vsObj) { skippedDraws++; return; }'); return; }
-	const psObj = S.shader[1] ? objs.get(S.shader[1]) : null;
+	let psObj = S.shader[1] ? objs.get(S.shader[1]) : null;
 	const layout = S.layout ? objs.get(S.layout) : null;
 	if (!layout) { skipDraw('if (!layout) { skippedDraws++; return; }'); return; }
-	const vsProg = shaderProgram(vsObj);
-	const psProg = psObj ? shaderProgram(psObj) : null;
+	let vsProg = shaderProgram(vsObj);
+	let psProg = psObj ? shaderProgram(psObj) : null;
 	if (!vsProg || (psObj && !psProg)) { skipDraw('if (!vsProg || (psObj && !psProg)) { skippedDraws++; return;'); return; }
+	if (vsProg.overTex || (psProg && psProg.overTex)) {		// more textures than this device allows per stage: a variant for the textures bound now (fitTextures)
+		const vv = vsProg.overTex ? fitTextures(vsObj, vsProg, 0) : null, pv = psProg && psProg.overTex ? fitTextures(psObj, psProg, 1) : null;
+		if ((vsProg.overTex && !vv) || (psProg && psProg.overTex && !pv)) { skipDraw('texture limit'); return; }
+		if (vv) { vsObj = vv.obj; vsProg = vv.prog; }
+		if (pv) { psObj = pv.obj; psProg = pv.prog; }
+		if (lastFitPl !== vsObj.hash + '|' + (psObj ? psObj.hash : '')) { lastFitPl = vsObj.hash + '|' + (psObj ? psObj.hash : ''); pdirty = true; }
+	} else if (lastFitPl) { lastFitPl = ''; pdirty = true; }
 	prepareDepthProxies(vsProg, 0);
 	if (psProg) prepareDepthProxies(psProg, 1);
 	if (!ensurePass()) { skipDraw('if (!ensurePass()) { skippedDraws++; return; }'); return; }
