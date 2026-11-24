@@ -91,7 +91,7 @@ function mapFormat(f, bind) {
 	case DXGI.R16G16B16A16_UNORM: return { format: 'rgba16float' };	// no core rgba16unorm: TODO texture-formats-tier1
 	case DXGI.R32G32_FLOAT: return { format: 'rg32float' };
 	case DXGI.R10G10B10A2_TYPELESS: case DXGI.R10G10B10A2_UNORM: return { format: 'rgb10a2unorm' };
-	case DXGI.R11G11B10_FLOAT: return { format: 'rg11b10ufloat' };
+	case DXGI.R11G11B10_FLOAT: return noRG11 ? { format: 'rgba16float', r11: true } : { format: 'rg11b10ufloat' };		// r11: uploads are converted (uploadTexture)
 	case DXGI.R8G8B8A8_TYPELESS: case DXGI.R8G8B8A8_UNORM: return { format: 'rgba8unorm', views: ['rgba8unorm-srgb'] };
 	case DXGI.R8G8B8A8_UNORM_SRGB: return { format: 'rgba8unorm-srgb', views: ['rgba8unorm'] };
 	case DXGI.B8G8R8A8_TYPELESS: case DXGI.B8G8R8A8_UNORM: case DXGI.B8G8R8X8_UNORM: return { format: 'bgra8unorm', views: ['bgra8unorm-srgb'] };
@@ -100,7 +100,7 @@ function mapFormat(f, bind) {
 	case DXGI.R32_TYPELESS: return { format: ds ? 'depth32float' : 'r32float' };
 	case DXGI.D32_FLOAT: return { format: 'depth32float' };
 	case DXGI.R32_FLOAT: return { format: 'r32float' };
-	case DXGI.R32G8X24_TYPELESS: case DXGI.D32_FLOAT_S8X24_UINT: return { format: 'depth32float-stencil8' };
+	case DXGI.R32G8X24_TYPELESS: case DXGI.D32_FLOAT_S8X24_UINT: return { format: noD32S8 ? 'depth24plus-stencil8' : 'depth32float-stencil8' };
 	case DXGI.R24G8_TYPELESS: case DXGI.D24_UNORM_S8_UINT: return { format: 'depth24plus-stencil8' };
 	case DXGI.R8G8_TYPELESS: case DXGI.R8G8_UNORM: return { format: 'rg8unorm' };
 	case DXGI.R16_TYPELESS: return { format: ds ? 'depth16unorm' : 'r16float' };
@@ -134,11 +134,15 @@ const isDepth = (format) => format.startsWith('depth') || format === 'stencil8';
 
 // ---- state --------------------------------------------------------------------------------------------------------------
 let gpu = null, adapter = null, device = null;
+// Optional features the D3D11 renderer relies on, and what is done without them (initDevice sets these; Chromebook and phone GPUs often lack some):
+//   float32-filterable: 32-bit float textures read where the shader filters go through a 16-bit float copy (halfProxy; depth proxies are r16float)
+//   depth32float-stencil8: D32_FLOAT_S8X24 depth buffers become depth24plus-stencil8; rg11b10ufloat-renderable: R11G11B10_FLOAT textures become rgba16float
+let noF32Filter = false, noD32S8 = false, noRG11 = false;
 let mem = null, memBuffer = null, i32 = null, u32 = null, f32 = null, u8 = null, ringBase = 0, ringSize = 0;
 let canvas = null, canvasCtx = null, canvasFormat = null, blit = null, canvasConfigured = false;
 let fpsChannel = null, fpsOverlayN = 0, fpsOverlayT = 0;
 let encoder = null, pass = null, passKey = '';
-let errorCount = 0, errorCount0 = 0, clampedDraws = 0, clampedDraws0 = 0;
+let errorCount = 0, errorCount0 = 0, clampedDraws = 0, clampedDraws0 = 0, gpuErrorChannel = null;
 const errorKinds = new Map();		// normalised message -> { n, msg }
 function dumpErrors() { for (const [k, e] of [...errorKinds].sort((a, b) => b[1].n - a[1].n).slice(0, 15)) logLine('  error x' + e.n + ': ' + e.msg.slice(0, 300)); }
 let drawCount = 0, skippedDraws = 0;
@@ -263,6 +267,15 @@ function parseWgsl(text) {
 		}
 		bindings.push(b);
 	}
+	// Float textures the shader only reads with textureLoad (never filters): without float32-filterable, their binding is declared unfilterable (layoutEntry) and takes
+	// a 32-bit float texture as it is, at full precision. Conservative: every mention of the name other than its declaration must be a textureLoad/textureDimensions/
+	// textureNumLevels/textureNumLayers argument (one passed to a helper function, or in a comment, keeps it filterable).
+	for (const b of bindings) {
+		if (b.kind !== 'texture' || b.sample !== 'float' || b.ms) continue;
+		const all = text.match(new RegExp('\\b' + b.name + '\\b', 'g')) || [];
+		const loads = text.match(new RegExp('\\b(?:textureLoad|textureDimensions|textureNumLevels|textureNumLayers)\\s*\\(\\s*' + b.name + '\\b', 'g')) || [];
+		b.loadOnly = loads.length > 0 && loads.length === all.length - 1;
+	}
 	// fragment outputs: locations of the return value of `fn main`
 	const outputs = [];
 	const sig = /@fragment\s*fn\s+main\s*\((?:[^()]|\([^)]*\))*\)\s*->\s*([^{]+)\{/.exec(text);		// parameters contain @location(n)
@@ -288,7 +301,7 @@ function layoutEntry(b, stage) {
 	case 'read-only-storage': e.buffer = { type: 'read-only-storage' }; break;
 	case 'sampler': e.sampler = { type: 'filtering' }; break;
 	case 'sampler-comparison': e.sampler = { type: 'comparison' }; break;
-	case 'texture': e.texture = { sampleType: b.sample, viewDimension: b.dim, multisampled: !!b.ms }; break;
+	case 'texture': e.texture = { sampleType: noF32Filter && b.loadOnly ? 'unfilterable-float' : b.sample, viewDimension: b.dim, multisampled: !!b.ms }; break;		// loadOnly: parseWgsl
 	case 'storage-texture': e.storageTexture = { access: b.access, format: b.format, viewDimension: b.dim }; break;
 	}
 	return e;
@@ -518,7 +531,18 @@ async function initDevice(msg) {
 	if (isNode && process.env.WGPU_LIMITS) for (const kv of process.env.WGPU_LIMITS.split(',')) { const [k, v] = kv.split('='); limits[k] = +v; }
 	// ?limits=name:value,... (browser): the same, lowered to a weaker device's limits (never below the WebGPU defaults)
 	if (!isNode) for (const kv of (new URLSearchParams(self.location.search).get('limits') || '').split(',').filter(Boolean)) { const [k, v] = kv.split(':'); limits[k] = +v; }
-	device = await adapter.requestDevice({ requiredFeatures, requiredLimits: limits });
+	// ?nofeatures=a,b (diagnostics): leave optional features out, to reproduce a device that lacks them
+	const drop = isNode ? [] : (new URLSearchParams(self.location.search).get('nofeatures') || '').split(',').filter(Boolean);
+	device = await adapter.requestDevice({ requiredFeatures: requiredFeatures.filter((f) => !drop.includes(f)), requiredLimits: limits });
+	noF32Filter = !device.features.has('float32-filterable');
+	noD32S8 = !device.features.has('depth32float-stencil8');
+	noRG11 = !device.features.has('rg11b10ufloat-renderable');
+	const lacking = want.filter((f) => !device.features.has(f));
+	if (lacking.length) logLine('this device lacks: ' + lacking.join(', ') + (noF32Filter || noD32S8 || noRG11 ? ' (worked around: ' + [noF32Filter && '32-bit float textures filtered through 16-bit copies', noD32S8 && '24-bit depth', noRG11 && 'rgba16float HDR targets'].filter(Boolean).join(', ') + ')' : ''));
+	if (!isNode) {
+		const info = adapter.info || {};
+		new BroadcastChannel('game-progress').postMessage({ gpuInfo: { name: [info.vendor, info.architecture, info.description].filter(Boolean).join(' ') || 'unknown', lacking } });
+	}
 	device.addEventListener('uncapturederror', (ev) => {
 		errorCount++;
 		Atomics.add(i32, ringW + 4, 1);
@@ -526,7 +550,11 @@ async function initDevice(msg) {
 		const key = msg.replace(/0x[0-9a-f]+|\d+/g, 'N').slice(0, 200);
 		const e = errorKinds.get(key);
 		if (e) e.n++;
-		else { errorKinds.set(key, { n: 1, msg }); if (errorKinds.size <= 40) logLine('validation error: ' + msg.slice(0, 700)); }
+		else {
+			errorKinds.set(key, { n: 1, msg });
+			if (errorKinds.size <= 40) logLine('validation error: ' + msg.slice(0, 700));
+			if (!isNode && errorKinds.size <= 3) (gpuErrorChannel || (gpuErrorChannel = new BroadcastChannel('game-progress'))).postMessage({ gpuError: msg.split('\n').slice(0, 3).join(' ').slice(0, 300), kinds: errorKinds.size, total: errorCount });
+		}
 	});
 	device.lost.then((info) => {
 		logLine('device lost: ' + info.reason + ' ' + info.message);
@@ -581,7 +609,7 @@ function createTexture(id, dim, w, h, d, mips, arraySize, dxgi, bind, samples) {
 	const bytes = textureBytes(desc);
 	texBytesAlive += bytes; texCount++;
 	if (texBytesAlive > texBytesPeak) texBytesPeak = texBytesAlive;
-	objs.set(id, { kind: 'texture', tex, desc, format: m.format, views: new Map(), a8: !!m.a8, bytes });
+	objs.set(id, { kind: 'texture', tex, desc, format: m.format, views: new Map(), a8: !!m.a8, r11: !!m.r11, bytes });
 }
 
 // Exit report: where the GPU-side memory of the mirror goes (diagnostics for the 4 GB target).
@@ -644,6 +672,14 @@ function uploadTexture(id, mip, slice, x, y, z, w, h, d, bytesPerRow, rowsPerIma
 		const out = new Uint8Array(w * h * 4);
 		for (let r = 0; r < h; r++) for (let c = 0; c < w; c++) out[(r * w + c) * 4 + 3] = data[r * bytesPerRow + c];
 		data = out; bpr = w * 4;
+	}
+	if (o.r11) {		// R11G11B10_FLOAT kept as rgba16float (no rg11b10ufloat-renderable): each packed texel becomes four halves (the 11/10-bit floats are halves without sign and low mantissa bits)
+		const rows = d * (rowsPerImage || h), out = new Uint16Array(w * rows * 4), dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+		for (let r = 0; r < rows; r++) for (let c = 0; c < w; c++) {
+			const v = dv.getUint32(r * bytesPerRow + c * 4, true), o4 = (r * w + c) * 4;
+			out[o4] = (v & 0x7ff) << 4; out[o4 + 1] = ((v >>> 11) & 0x7ff) << 4; out[o4 + 2] = ((v >>> 22) & 0x3ff) << 5; out[o4 + 3] = 0x3c00;
+		}
+		data = new Uint8Array(out.buffer); bpr = w * 8;
 	}
 	device.queue.writeTexture({ texture: o.tex, mipLevel: mip, origin }, data,
 		{ bytesPerRow: bpr, rowsPerImage }, { width: w, height: h, depthOrArrayLayers: d });
@@ -875,11 +911,15 @@ function srvView(srv, b) {
 	if (!t || t.kind !== 'texture') return null;
 	let proxied = false;
 	if (isDepth(t.format) && b.sample !== 'depth') {
-		t = depthProxy(t, b.sample === 'uint' ? 'stencil' : 'depth');
+		t = depthProxy(t, b.sample === 'uint' ? 'stencil' : 'depth', noF32Filter && b.loadOnly);
 		proxied = true; sawProxy = true;
 	} else if (!isDepth(t.format) && b.sample === 'depth') {
 		t = floatToDepthProxy(t);
 		proxied = true; sawProxy = true;
+	}
+	if (noF32Filter && b.sample === 'float' && !b.loadOnly && HALF_OF[t.format]) {		// no float32-filterable: a filtering binding cannot take a 32-bit float texture
+		const h = halfProxy(t);
+		if (h !== t) { t = h; proxied = true; sawProxy = true; }
 	}
 	const key = b.dim + (proxied ? ':p' : '');
 	let v = srv.views.get(key);
@@ -911,8 +951,8 @@ function srvView(srv, b) {
 // (comparison or textureLoad of texture_depth_2d) and the translated code uses texture_2d<f32>. A proxy r32float (depth) or
 // r8uint (stencil) texture is refreshed by a render pass whenever the depth texture was drawn into since the last read.
 let proxyPipelines = {};
-function proxyPipeline(kind) {
-	if (proxyPipelines[kind]) return proxyPipelines[kind];
+function proxyPipeline(kind, format) {
+	if (proxyPipelines[kind + format]) return proxyPipelines[kind + format];
 	const code = kind === 'depth'
 		? `@group(0) @binding(0) var src: texture_depth_2d;
 		   @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
@@ -921,8 +961,63 @@ function proxyPipeline(kind) {
 		   @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
 		   @fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4<u32> { return textureLoad(src, vec2i(pos.xy), 0); }`;
 	const module = device.createShaderModule({ code });
-	return (proxyPipelines[kind] = device.createRenderPipeline({ layout: 'auto', vertex: { module, entryPoint: 'vs' },
-		fragment: { module, entryPoint: 'fs', targets: [{ format: kind === 'depth' ? 'r32float' : 'r8uint' }] } }));
+	return (proxyPipelines[kind + format] = device.createRenderPipeline({ layout: 'auto', vertex: { module, entryPoint: 'vs' },
+		fragment: { module, entryPoint: 'fs', targets: [{ format }] } }));
+}
+const depthProxyFormat = () => (noF32Filter ? 'r16float' : 'r32float');		// a depth texture read where the shader filters: filterable without float32-filterable (16-bit: ~0.05 % relative precision)
+// A layout for the helper passes below that read any float texture with textureLoad: 'unfilterable-float' takes 32-bit float textures on every device ('auto'
+// would make it a filtering binding, invalid for them without float32-filterable).
+function loadLayout(viewDimension) {
+	const key = 'load|' + viewDimension;
+	return layoutCache.get(key) || layoutCache.set(key, device.createPipelineLayout({ bindGroupLayouts: [device.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float', viewDimension } }] })] })).get(key);
+}
+
+// ---- 32-bit float textures read where the shader filters, on a device without float32-filterable ---------------------------------------------------------------
+// WebGPU lets a shader filter r32float / rg32float / rgba32float textures only with the optional float32-filterable feature. The translated shaders declare every
+// float texture filterable, so without it any bind group holding such a texture is invalid, and its draws (or the whole submit) are dropped: exposure, lighting and
+// fog read depth and luminance this way, and the picture came out overexposed, white with black specks. Such a texture is bound through a 16-bit float copy instead,
+// refreshed like the depth proxies whenever it was written since it was last read (markColorDirty).
+const HALF_OF = { r32float: 'r16float', rg32float: 'rg16float', rgba32float: 'rgba16float' };
+const halfPipelines = {};
+function halfPipeline(format) {
+	if (halfPipelines[format]) return halfPipelines[format];
+	const module = device.createShaderModule({ code: `@group(0) @binding(0) var src: texture_2d<f32>;
+		@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
+		@fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f { return textureLoad(src, vec2i(pos.xy), 0); }` });
+	return (halfPipelines[format] = device.createRenderPipeline({ layout: loadLayout('2d'), vertex: { module, entryPoint: 'vs' }, fragment: { module, entryPoint: 'fs', targets: [{ format }] } }));
+}
+function halfProxy(t) {
+	let px = t.proxy_half;
+	if (!px) {
+		const d = t.desc;
+		if (d.dimension !== '2d' || (d.sampleCount || 1) > 1) { logOnce('half' + d.dimension, 'no 16-bit copy for a ' + d.dimension + ' ' + t.format + ' texture: bound as it is'); return t; }
+		const format = HALF_OF[t.format];
+		const tex = device.createTexture({ size: d.size, mipLevelCount: d.mipLevelCount, sampleCount: 1, dimension: '2d', format, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+		px = t.proxy_half = { kind: 'texture', tex, desc: { size: d.size, mipLevelCount: d.mipLevelCount, dimension: '2d', sampleCount: 1 }, format, views: new Map(), dirty: true };
+		logOnce('halfproxy' + t.format, 'no float32-filterable: ' + t.format + ' textures are read through ' + format + ' copies');
+	}
+	if (px.dirty) {
+		endPass();
+		const pl = halfPipeline(px.format), enc = getEncoder();
+		if (!px.passes) {		// made once (see floatToDepthProxy)
+			px.passes = [];
+			for (let mip = 0; mip < t.desc.mipLevelCount; mip++) for (let layer = 0; layer < t.desc.size.depthOrArrayLayers; layer++) {
+				const src = t.tex.createView({ dimension: '2d', baseMipLevel: mip, mipLevelCount: 1, baseArrayLayer: layer, arrayLayerCount: 1 });
+				const dst = px.tex.createView({ dimension: '2d', baseMipLevel: mip, mipLevelCount: 1, baseArrayLayer: layer, arrayLayerCount: 1 });
+				px.passes.push({ dst, bg: device.createBindGroup({ layout: pl.getBindGroupLayout(0), entries: [{ binding: 0, resource: src }] }) });
+			}
+		}
+		for (const r of px.passes) {
+			const p = enc.beginRenderPass({ colorAttachments: [{ view: r.dst, loadOp: 'clear', storeOp: 'store' }] });
+			p.setPipeline(pl);
+			p.setBindGroup(0, r.bg);
+			p.draw(3);
+			p.end();
+		}
+		usedInEncoder.add(t);
+		px.dirty = false;
+	}
+	return px;
 }
 
 let f2dPipeline = null;
@@ -940,7 +1035,7 @@ function floatToDepthProxy(t) {
 			const module = device.createShaderModule({ code: `@group(0) @binding(0) var src: texture_2d<f32>;
 				@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
 				@fragment fn fs(@builtin(position) pos: vec4f) -> @builtin(frag_depth) f32 { return textureLoad(src, vec2i(pos.xy), 0).x; }` });
-			f2dPipeline = device.createRenderPipeline({ layout: 'auto', vertex: { module, entryPoint: 'vs' }, fragment: { module, entryPoint: 'fs', targets: [] },
+			f2dPipeline = device.createRenderPipeline({ layout: loadLayout('2d'), vertex: { module, entryPoint: 'vs' }, fragment: { module, entryPoint: 'fs', targets: [] },
 				depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'always' } });
 		}
 		const enc = getEncoder(), layers = t.desc.size.depthOrArrayLayers;
@@ -964,21 +1059,22 @@ function floatToDepthProxy(t) {
 	}
 	return px;
 }
-function markColorDirty(t) { if (t && t.proxy_fdepth) t.proxy_fdepth.dirty = true; }
+function markColorDirty(t) { if (t && t.proxy_fdepth) t.proxy_fdepth.dirty = true; if (t && t.proxy_half) t.proxy_half.dirty = true; }
 
-function depthProxy(t, kind) {
-	// returns the proxy texture object of depth texture `t`, refreshed if the depth texture changed since the last refresh
-	const key = 'proxy_' + kind;
+function depthProxy(t, kind, full) {
+	// returns the proxy texture object of depth texture `t`, refreshed if the depth texture changed since the last refresh. full: a binding that only loads (r32float always)
+	const format = kind === 'depth' ? (full ? 'r32float' : depthProxyFormat()) : 'r8uint';
+	const key = 'proxy_' + kind + (format === 'r16float' ? '16' : '');
 	let px = t[key];
 	if (!px) {
 		const d = t.desc;
 		const tex = device.createTexture({ size: d.size, mipLevelCount: d.mipLevelCount, sampleCount: 1, dimension: '2d',
-			format: kind === 'depth' ? 'r32float' : 'r8uint', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT });
+			format, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
 		px = t[key] = { kind: 'texture', tex, desc: { size: d.size, mipLevelCount: d.mipLevelCount, dimension: '2d', sampleCount: 1 }, format: tex.format, views: new Map(), dirty: true };
 	}
 	if (px.dirty) {
 		endPass();
-		const pl = proxyPipeline(kind), enc = getEncoder();
+		const pl = proxyPipeline(kind, format), enc = getEncoder();
 		const layers = t.desc.size.depthOrArrayLayers;
 		if (!px.passes) {		// made once per proxy (see floatToDepthProxy)
 			px.passes = [];
@@ -1002,7 +1098,7 @@ function depthProxy(t, kind) {
 	return px;
 }
 
-function markDepthDirty(t) { t.proxy_depth && (t.proxy_depth.dirty = true); t.proxy_stencil && (t.proxy_stencil.dirty = true); }
+function markDepthDirty(t) { t.proxy_depth && (t.proxy_depth.dirty = true); t.proxy_depth16 && (t.proxy_depth16.dirty = true); t.proxy_stencil && (t.proxy_stencil.dirty = true); }
 
 // ---- pipelines --------------------------------------------------------------------------------------------------------------------
 const layoutCache = new Map();
@@ -1472,8 +1568,9 @@ function prepareDepthProxies(prog, stage) {
 		const b = texs[i];
 		const id = S.srv[stage][b.binding - 32], srv = id ? objs.get(id) : null;
 		const t = srv && !srv.isBuf ? objs.get(srv.res) : null;
-		if (t && t.kind === 'texture' && isDepth(t.format) && b.sample !== 'depth') { any = true; depthProxy(t, b.sample === 'uint' ? 'stencil' : 'depth'); }
+		if (t && t.kind === 'texture' && isDepth(t.format) && b.sample !== 'depth') { any = true; depthProxy(t, b.sample === 'uint' ? 'stencil' : 'depth', noF32Filter && b.loadOnly); }
 		else if (t && t.kind === 'texture' && !isDepth(t.format) && b.sample === 'depth') { any = true; floatToDepthProxy(t); }
+		else if (t && t.kind === 'texture' && noF32Filter && b.sample === 'float' && !b.loadOnly && HALF_OF[t.format]) { any = true; halfProxy(t); }		// the 16-bit copies too (srvView)
 	}
 	sc.none = !any; sc.e = bindEpoch[stage]; sc.g = gEpoch;
 }
@@ -2317,7 +2414,22 @@ function generateMips(srvId) {
 	const fmt = t.format;
 	if (isDepth(fmt) || fmt.startsWith('bc') || t.desc.dimension === '3d') { logOnce('mips' + fmt, 'GenerateMips: unsupported texture format/dimension ' + fmt + ' ' + t.desc.dimension); return; }
 	endPass();
+	// Without float32-filterable a 32-bit float texture cannot be read through a linear sampler (the bind group is invalid, and with it the whole submit: the luminance
+	// average of auto exposure is made this way): each texel of the next mip is then the average of its 2x2 texels, read with textureLoad (what the linear sample at
+	// the centre of the four gives for even sizes).
+	const byLoad = noF32Filter && !!HALF_OF[fmt];
 	let pl = mipPipelines.get(fmt);
+	if (!pl && byLoad) {
+		const module = device.createShaderModule({ code: `@group(0) @binding(0) var src: texture_2d<f32>;
+			@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3)); return vec4f(p[i], 0, 1); }
+			@fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+				let s = vec2i(textureDimensions(src, 0)) - 1;
+				let p = vec2i(pos.xy) * 2;
+				return (textureLoad(src, min(p, s), 0) + textureLoad(src, min(p + vec2i(1, 0), s), 0) + textureLoad(src, min(p + vec2i(0, 1), s), 0) + textureLoad(src, min(p + vec2i(1, 1), s), 0)) * 0.25;
+			}` });
+		pl = device.createRenderPipeline({ layout: loadLayout('2d'), vertex: { module, entryPoint: 'vs' }, fragment: { module, entryPoint: 'fs', targets: [{ format: fmt }] } });
+		mipPipelines.set(fmt, pl);
+	}
 	if (!pl) {
 		const module = device.createShaderModule({ code: `@group(0) @binding(0) var src: texture_2d<f32>;
 			@group(0) @binding(1) var smp: sampler;
@@ -2336,7 +2448,7 @@ function generateMips(srvId) {
 		for (let layer = 0; layer < layers; layer++) for (let mip = 1; mip < t.desc.mipLevelCount; mip++) {
 			const src = t.tex.createView({ dimension: '2d', baseMipLevel: mip - 1, mipLevelCount: 1, baseArrayLayer: layer, arrayLayerCount: 1 });
 			const dst = t.tex.createView({ dimension: '2d', baseMipLevel: mip, mipLevelCount: 1, baseArrayLayer: layer, arrayLayerCount: 1 });
-			t.mipPasses.push({ dst, bg: device.createBindGroup({ layout: pl.getBindGroupLayout(0), entries: [{ binding: 0, resource: src }, { binding: 1, resource: mipSampler }] }) });
+			t.mipPasses.push({ dst, bg: device.createBindGroup({ layout: pl.getBindGroupLayout(0), entries: byLoad ? [{ binding: 0, resource: src }] : [{ binding: 0, resource: src }, { binding: 1, resource: mipSampler }] }) });
 		}
 	}
 	for (const r of t.mipPasses) {

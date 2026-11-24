@@ -741,7 +741,9 @@ async function userdataWrite(path, record) {
 			t.onerror = t.onabort = () => reject(t.error);
 		});
 		log('[io] userdata ' + (record ? 'stored ' + path + ' (' + record.data.length + ' bytes)' : 'deleted ' + path));
+		if (bc) bc.postMessage({ saved: path, bytes: record ? record.data.length : 0, deleted: !record });		// the page shows "Game saved"
 	} catch (e) {
+		if (bc) bc.postMessage({ saved: path, error: String(e && e.message || e) });
 		fetch('/log', { method: 'POST', body: '[io] userdata ' + path + ' NOT stored (the save will be lost when the tab closes): ' + e }).catch(() => {});		// whatever ?log=1 says: a lost save is worth a line
 	}
 }

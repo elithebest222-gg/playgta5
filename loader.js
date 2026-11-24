@@ -124,7 +124,8 @@ self.onmessage = (ev) => {
 				if (typeof FS === 'undefined' || typeof addRunDependency !== 'function' || typeof indexedDB === 'undefined') return;
 				addRunDependency('userdata');
 				let finished = false;
-				const finish = (note) => { if (finished) return; finished = true; self.__log('[loader] userdata: ' + note); self.__logFlush(); removeRunDependency('userdata'); };
+				let restored = 0;
+				const finish = (note) => { if (finished) return; finished = true; self.__log('[loader] userdata: ' + note); self.__logFlush(); console.log('loader: userdata ' + note); try { new BroadcastChannel('game-progress').postMessage({ userdataRestored: restored }); } catch (e) {} removeRunDependency('userdata'); };
 				setTimeout(() => finish('timed out'), 8000);
 				try {
 					const r = indexedDB.open('gta5-userdata', 1);
@@ -137,7 +138,7 @@ self.onmessage = (ev) => {
 							req.onerror = () => finish('read failed: ' + req.error);
 							req.onsuccess = () => {
 								const c = req.result;
-								if (!c) { finish('restored ' + n + ' file(s), ' + bytes + ' bytes'); return; }
+								if (!c) { restored = n; finish('restored ' + n + ' file(s), ' + bytes + ' bytes'); return; }
 								const path = String(c.key);
 								try {
 									if (path.startsWith('/userdata/') && c.value && c.value.data) {
