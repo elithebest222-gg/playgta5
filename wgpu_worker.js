@@ -485,7 +485,8 @@ function shaderProgram(sh) {
 	const fs = isNode ? require('fs') : null;
 	const source = isNode ? fs.readFileSync(shaderDir + '/' + sh.hash + '.wgsl', 'utf8') : (sh.fetched && sh.fetched.text);
 	if (!source) { logOnce('nosrc' + sh.hash, 'shader source of ' + sh.hash + ' was not fetched'); return null; }
-	const { text, pack } = packUniforms(source);
+	const { text: packed, pack } = packUniforms(source);
+	const text = nanRules ? d3dNanRules(packed.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, '')) : packed;		// see d3dNanRules (comments out first: a "max(" in one would mislead it)
 	shaderModuleCount++;
 	const tm0 = performance.now();
 	const module = device.createShaderModule({ code: text, label: rec.effect + '::' + rec.program });
@@ -572,6 +573,46 @@ function fitTextures(obj, prog, stage) {
 	return v;
 }
 const STAGE_NAME = ['vs', 'ps', 'cs'];
+
+// ---- D3D's NaN rules for min / max / clamp / saturate ---------------------------------------------------------------------------------------------------------
+// In D3D10+ a NaN operand of min/max yields the other operand (IEEE 754-2008 minNum/maxNum) and saturate(NaN) is 0: shaders rely on that to clean up NaN (a normal
+// of length 0, 0/0) before it spreads. WGSL leaves it undefined, and Tint's Vulkan output (FMin/FMax/FClamp) lets NaN through on Intel GPUs: on a Chromebook the
+// lighting buffer came out ~95 % NaN, shown as white snow, trees and walls (Direct3D 12 on Windows follows the D3D rules, so this is off there). Each call is
+// rewritten with explicit NaN tests, the way D3D-on-Vulkan layers use NMin/NMax/NClamp. A call whose (rewritten) arguments are long is left as it is (each
+// argument is repeated a few times). ?nansafe=1 / ?nansafe=0 on the page forces it on or off.
+const nanRules = !isNode && ((p) => (p === '1' || p === '0' ? p === '1' : !/Windows/.test(self.navigator.userAgent)))(new URLSearchParams(self.location.search).get('nansafe'));
+function wgslArgs(s, open) {		// the arguments of the call whose '(' is at s[open]: { list, end (after ')') } or null
+	const list = [];
+	let depth = 0, start = open + 1;
+	for (let i = open; i < s.length; i++) {
+		const c = s[i];
+		if (c === '(' || c === '[') depth++;
+		else if (c === ')' || c === ']') { depth--; if (depth === 0) { list.push(s.slice(start, i).trim()); return { list, end: i + 1 }; } }
+		else if (c === ',' && depth === 1) { list.push(s.slice(start, i).trim()); start = i + 1; }
+	}
+	return null;
+}
+function d3dNanRules(s) {
+	const re = /\b(min|max|clamp|saturate)\s*\(/g;
+	let out = '', last = 0, m;
+	while ((m = re.exec(s))) {
+		if (/\b(fn|let|var|const|alias|struct)\s*$/.test(s.slice(Math.max(0, m.index - 8), m.index)) || s[m.index - 1] === '.') continue;		// a declaration or a member, not a call
+		const call = wgslArgs(s, m.index + m[0].length - 1);
+		if (!call) continue;
+		const a = call.list.map(d3dNanRules), fn = m[1], P = (x) => '(' + x + ')';
+		const nanMax = (f, x, y) => 'select(select(' + f + '(' + x + ', ' + y + '), ' + x + ', ' + P(y) + ' != ' + P(y) + '), ' + y + ', ' + P(x) + ' != ' + P(x) + ')';
+		let rep = null;
+		if (a.every((x) => x.length <= 240)) {
+			if ((fn === 'min' || fn === 'max') && a.length === 2) rep = nanMax(fn, a[0], a[1]);
+			else if (fn === 'clamp' && a.length === 3) rep = 'select(clamp(' + a.join(', ') + '), ' + a[1] + ', ' + P(a[0]) + ' != ' + P(a[0]) + ')';		// as maxNum then minNum: NaN -> low
+			else if (fn === 'saturate' && a.length === 1) rep = 'select(saturate(' + a[0] + '), step(' + a[0] + ', ' + a[0] + ') * 0.0, ' + P(a[0]) + ' != ' + P(a[0]) + ')';		// NaN -> 0 (step() gives a zero of the right type that is never NaN)
+		}
+		out += s.slice(last, m.index) + (rep || fn + '(' + a.join(', ') + ')');
+		last = call.end;
+		re.lastIndex = call.end;
+	}
+	return out + s.slice(last);
+}
 
 async function initDevice(msg) {
 	if (isNode) {
@@ -2774,7 +2815,8 @@ let rtStatsT = 0;
 // (rgba16float / rg11b10ufloat, 600 px or wider) a 64x40 grid of the target is read back and counted for texels with a NaN, an Inf or a value over 1000 in RGB; whenever the count
 // of a target changes the draw's shaders are logged. Found on a Chromebook (Intel, Dawn/Vulkan, 2026-10-06): the lighting buffer was ~95 % NaN, which displays as white, and this PC's
 // has none - so the first draw that introduces NaN names the shader whose maths differs on that GPU.
-let nanHuntState = 0, nanHuntLabel = '', nanHuntLogged = 0, nanHuntScans = 0, nanHuntLastCount = -1, nanHuntPs = null, nanHuntDetails = 0;
+let nanHuntState = 0, nanHuntLabel = '', nanHuntLogged = 0, nanHuntScans = 0, nanHuntLastCount = -1, nanHuntPs = null, nanHuntDetails = 0, nanHuntFound = false;
+function nanNote(text) { logLine(text); (gpuErrorChannel || (gpuErrorChannel = new BroadcastChannel('game-progress'))).postMessage({ gpuError: text, kinds: 'NaN', total: 0 }); }
 const nanHuntPrev = new Map();
 const NAN_TEXEL = { r8uint: 1, r8unorm: 1, rg8unorm: 2, rgba8unorm: 4, bgra8unorm: 4, r16float: 2, rg16float: 4, rgba16float: 8, r32float: 4, rg32float: 8, rgba32float: 16, rg11b10ufloat: 4, rgb10a2unorm: 4 };
 // One texel of a texture (position given for a target of tw x th, scaled to the texture's size) as text: raw bytes, and decoded floats for the float formats.
@@ -2839,6 +2881,7 @@ async function nanScanAfterDraw() {
 	if (bad !== (prev || 0) || prev === undefined) {
 		nanHuntPrev.set(r.tex, bad);
 		if (nanHuntLogged++ < 100) logLine('nanhunt: ' + nanHuntLabel + ' -> target ' + r.tex + ' ' + w + 'x' + h + ' ' + t.format + ': bad texels ' + (prev === undefined ? 'first look ' : prev + ' -> ') + bad + ' of 2560' + (bad ? ' (first at ' + firstBad + ')' : ''));
+		if (bad && !prev && !nanHuntFound) { nanHuntFound = true; nanNote('NaN hunt: ' + bad + ' of 2560 samples of an HDR target turned NaN/Inf after ' + nanHuntLabel); }
 		if (bad && !prev && nanHuntDetails < 2) { nanHuntDetails++; try { await nanDetail(bx, by, gx, gy, w, h); } catch (e) { logLine('nanhunt detail failed: ' + e); } }
 	}
 }
@@ -2848,6 +2891,7 @@ let presentCount = 0;
 let shotEvery = isNode ? +(process.env.WGPU_SHOT_EVERY || 0) : 0;
 const shotPrefix = isNode ? (process.env.WGPU_SHOT_PREFIX || 'D:/wasm_tmp/shot_') : 'present';
 const shotAllRt = !isNode && new URLSearchParams(self.location.search).get('shotrt') === '1';		// the page's ?shotrt=1 (with ?shot=N): see present()
+const nanHuntParam = !isNode && new URLSearchParams(self.location.search).get('nanhunt') === '1';		// the page's ?nanhunt=1: the NaN hunt alone, 10 s after the world shows, its findings on the page
 let shotAllRtDone = false;
 async function present(id) {
 	const t = objs.get(id);
@@ -2947,9 +2991,9 @@ async function present(id) {
 		let n = 0;
 		for (const tid of [...frameStats.rts]) { const tt = objs.get(tid); if (tt && tt.desc.size.width >= 256 && n < 20) { n++; await floatStats(tid); } }
 	}
-	if (!isNode && shotAllRt) {		// the NaN hunt's frame: from this present to the next
-		if (nanHuntState === 2) { nanHuntState = 3; logLine('nanhunt: frame finished, ' + nanHuntScans + ' draws into HDR targets scanned'); }
-		else if (nanHuntState === 0 && worldSince && performance.now() - worldSince >= 30000) { nanHuntState = 2; logLine('nanhunt: scanning the next frame draw by draw'); }
+	if (!isNode && (shotAllRt || nanHuntParam)) {		// the NaN hunt's frame: from this present to the next
+		if (nanHuntState === 2) { nanHuntState = 3; logLine('nanhunt: frame finished, ' + nanHuntScans + ' draws into HDR targets scanned'); if (nanHuntParam && !nanHuntFound) nanNote('NaN hunt: no NaN or Inf found in this frame (' + nanHuntScans + ' draws scanned)'); }
+		else if (nanHuntState === 0 && worldSince && performance.now() - worldSince >= (nanHuntParam ? 10000 : 30000)) { nanHuntState = 2; logLine('nanhunt: scanning the next frame draw by draw'); }
 	}
 	if (!isNode && shotAllRt && !shotAllRtDone && worldSince && performance.now() - worldSince >= 20000) {
 		shotAllRtDone = true;
