@@ -18,6 +18,8 @@ self.onmessage = (ev) => {
 	if (m.noPack) gq.set('nopack', '1');		// ?nopack=1: shaders one by one instead of from the packs (diagnostics)
 	if (m.shotRt) gq.set('shotrt', '1');		// ?shotrt=1 (with ?shot=N): every render target of one frame after the world is shown goes to the dev server (diagnosis)
 	if (m.gpuLimits) gq.set('limits', m.gpuLimits);		// ?limits=name:value,...: a smaller device (diagnosis of weaker GPUs)
+	if (m.nanSafe) gq.set('nansafe', m.nanSafe);		// ?nansafe=1/0: D3D's NaN rules for min/max/saturate forced on/off (wgpu_worker.js d3dNanRules; default: off on Windows)
+	if (m.nanHunt) gq.set('nanhunt', '1');		// ?nanhunt=1: find the first draw that writes NaN into an HDR target, shown on the page
 	const B = m.base || '';		// the page's URL prefix for everything it loads (index.html BASE): /b/<build> on the PHP host, empty otherwise; the page's own folder on GitHub Pages
 	// m.local (index.html on GitHub Pages): the game files come from the folder the player picked, not from the host: { wasm: File, manifestText: the manifest the
 	// engine is given, manifest: the same parsed, files: a File (or null) per manifest entry, shaders: Map name -> File of the build's shaders folder, shaderDir }.

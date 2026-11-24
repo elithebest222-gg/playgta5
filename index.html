@@ -539,6 +539,8 @@ function startEngine(local) {
 		shotRt: q.get('shotrt') === '1',		// ?shotrt=1 (with ?shot=N): every render target of one frame after the world is shown to the dev server's shots/ (wgpu_worker.js)
 		noHints: q.get('nohints') === '1',		// ?nohints=1: do not fetch the streamer's queued reads ahead (io_worker.js drainHints; diagnostics)
 		noPack: q.get('nopack') === '1',		// ?nopack=1: fetch shaders one by one, not from the shader packs (wgpu_worker.js; diagnostics)
+		nanSafe: q.get('nansafe') || '',		// ?nansafe=1/0: D3D's NaN rules in the shaders forced on/off (wgpu_worker.js d3dNanRules)
+		nanHunt: q.get('nanhunt') === '1',		// ?nanhunt=1: name the first draw that writes NaN (white areas), top right
 		gpuLimits: q.get('limits') || '',		// ?limits=maxSampledTexturesPerShaderStage:16,... : request a smaller GPU device than the adapter offers (reproduces a weaker device's limits; wgpu_worker.js)
 		keepThreads: (q.get('keep') || '').split(',').reduce((m, g) => m | ({ replay: 1, net: 2, bink: 4, idle: 8 }[g] || 0), 0),		// ?keep=replay,net,bink,idle: start those thread groups (diagnostics)
 		cores,
