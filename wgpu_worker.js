@@ -486,7 +486,8 @@ function shaderProgram(sh) {
 	const source = isNode ? fs.readFileSync(shaderDir + '/' + sh.hash + '.wgsl', 'utf8') : (sh.fetched && sh.fetched.text);
 	if (!source) { logOnce('nosrc' + sh.hash, 'shader source of ' + sh.hash + ' was not fetched'); return null; }
 	const { text: packed, pack } = packUniforms(source);
-	const text = nanRules ? d3dNanRules(packed.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, '')) : packed;		// see d3dNanRules (comments out first: a "max(" in one would mislead it)
+	let text = nanRules ? d3dNanRules(packed.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, '')) : packed;		// see d3dNanRules (comments out first: a "max(" in one would mislead it)
+	if (nanRules && sh.stage === 1) text = nanFirewall(text);
 	shaderModuleCount++;
 	const tm0 = performance.now();
 	const module = device.createShaderModule({ code: text, label: rec.effect + '::' + rec.program });
@@ -581,6 +582,18 @@ const STAGE_NAME = ['vs', 'ps', 'cs'];
 // rewritten with explicit NaN tests, the way D3D-on-Vulkan layers use NMin/NMax/NClamp. A call whose (rewritten) arguments are long is left as it is (each
 // argument is repeated a few times). ?nansafe=1 / ?nansafe=0 on the page forces it on or off.
 const nanRules = !isNode && ((p) => (p === '1' || p === '0' ? p === '1' : !/Windows/.test(self.navigator.userAgent)))(new URLSearchParams(self.location.search).get('nansafe'));
+// Pixel shader outputs: a NaN or infinite component becomes 0 before it is written (with the NaN rules: not on Windows). On an Intel Chromebook the sun's deferred light
+// (directional::PS_directional_standard) still wrote NaN/Inf into ~83 % of the lighting buffer, shown as white. With this no pass can hand NaN on to the next through a
+// render target, and a pass that makes it leaves those pixels without its light (darker, not white). The outputs are the module's o0..o7, written by main_inner() (as
+// the alpha-to-coverage variant assumes too).
+function nanFirewall(text) {
+	const outs = [...text.matchAll(/var<private>\s+(o\d)\s*:\s*(?:vec4<f32>|vec4f)\s*;/g)].map((m) => m[1]);
+	if (!outs.length || !/\n\s*main_inner\([^;]*\);/.test(text)) return text;
+	// NaN and infinity tested on the bits (exponent all ones): WGSL lets compilers assume floats are never NaN, and they fold x != x to false (SwiftShader does).
+	// Infinity goes too: written to a 16-bit float target it can come out as NaN (SwiftShader's conversion does that).
+	const fix = outs.map((o) => '\n  ' + o + ' = select(' + o + ', vec4<f32>(0.0), (bitcast<vec4<u32>>(' + o + ') & vec4<u32>(0x7fffffffu)) >= vec4<u32>(0x7f800000u));').join('');
+	return text.replace(/(\n\s*main_inner\([^;]*\);)/, '$1' + fix);
+}
 function wgslArgs(s, open) {		// the arguments of the call whose '(' is at s[open]: { list, end (after ')') } or null
 	const list = [];
 	let depth = 0, start = open + 1;
@@ -2050,7 +2063,7 @@ function doDraw(p) {
 		else pass.draw(dCount, dInst, vFirst, iFirst);
 	}
 	drawCount++;
-	if (nanHuntState === 2) { nanHuntLabel = vsProg.label + ' + ' + (psProg ? psProg.label : '-') + ' (draw ' + drawCount + ')'; nanHuntPs = psProg; }
+	if (nanHuntState === 2) { nanHuntLabel = vsProg.label + ' + ' + (psProg ? psProg.label : '-') + ' (draw ' + drawCount + ')'; nanHuntPs = psProg; nanHuntVs = vsProg; }
 	if (shotEvery || shotAllRt) {
 		const t0 = S.rt[0].tex ? objs.get(S.rt[0].tex) : null;
 		const tk = 'rt0=' + S.rt[0].tex + (t0 ? '(' + t0.desc.size.width + 'x' + t0.desc.size.height + ' ' + t0.format + ')' : '') + ' ds=' + S.ds.tex;
@@ -2815,7 +2828,7 @@ let rtStatsT = 0;
 // (rgba16float / rg11b10ufloat, 600 px or wider) a 64x40 grid of the target is read back and counted for texels with a NaN, an Inf or a value over 1000 in RGB; whenever the count
 // of a target changes the draw's shaders are logged. Found on a Chromebook (Intel, Dawn/Vulkan, 2026-10-06): the lighting buffer was ~95 % NaN, which displays as white, and this PC's
 // has none - so the first draw that introduces NaN names the shader whose maths differs on that GPU.
-let nanHuntState = 0, nanHuntLabel = '', nanHuntLogged = 0, nanHuntScans = 0, nanHuntLastCount = -1, nanHuntPs = null, nanHuntDetails = 0, nanHuntFound = false;
+let nanHuntState = 0, nanHuntLabel = '', nanHuntLogged = 0, nanHuntScans = 0, nanHuntLastCount = -1, nanHuntPs = null, nanHuntVs = null, nanHuntDetails = 0, nanHuntFound = false;
 function nanNote(text) { logLine(text); (gpuErrorChannel || (gpuErrorChannel = new BroadcastChannel('game-progress'))).postMessage({ gpuError: text, kinds: 'NaN', total: 0 }); }
 const nanHuntPrev = new Map();
 const NAN_TEXEL = { r8uint: 1, r8unorm: 1, rg8unorm: 2, rgba8unorm: 4, bgra8unorm: 4, r16float: 2, rg16float: 4, rgba16float: 8, r32float: 4, rg32float: 8, rgba32float: 16, rg11b10ufloat: 4, rgb10a2unorm: 4 };
@@ -2842,6 +2855,8 @@ async function nanReadTexel(t, x, y, tw, th, mip = 0) {
 // The pixel shader's inputs for a draw whose output has NaN: every bound texture at the texel (a bad one and a good one), and the constant buffers (as floats).
 async function nanDetail(bx, by, gx, gy, tw, th) {
 	const lines = ['nanhunt detail for ' + nanHuntLabel + ': bad texel ' + bx + ',' + by + ', good texel ' + gx + ',' + gy];
+	const rt = S.rt[0].tex ? objs.get(S.rt[0].tex) : null;
+	if (rt) { lines.push('  output target bad : ' + await nanReadTexel(rt, bx, by, tw, th)); if (gx >= 0) lines.push('  output target good: ' + await nanReadTexel(rt, gx, gy, tw, th)); }
 	for (let i = 0; i < 32; i++) {
 		const sid = S.srv[1][i], srv = sid ? objs.get(sid) : null, t = srv && !srv.isBuf ? objs.get(srv.res) : null;
 		if (!t || t.kind !== 'texture') continue;
@@ -2854,6 +2869,7 @@ async function nanDetail(bx, by, gx, gy, tw, th) {
 		lines.push('  ps cb b' + m.binding + (o && o.shadow ? ' [' + Array.from(new Float32Array(o.shadow.buffer, o.shadow.byteOffset, Math.min(256, o.shadow.length >> 2))).map((x) => +x.toPrecision(6)).join(',') + ']' : ' (no CPU copy)'));
 	}
 	logLine(lines.join('\n'));
+	return lines;
 }
 async function nanScanAfterDraw() {
 	const r = S.rt[0], t = r.tex ? objs.get(r.tex) : null;
@@ -2882,7 +2898,19 @@ async function nanScanAfterDraw() {
 		nanHuntPrev.set(r.tex, bad);
 		if (nanHuntLogged++ < 100) logLine('nanhunt: ' + nanHuntLabel + ' -> target ' + r.tex + ' ' + w + 'x' + h + ' ' + t.format + ': bad texels ' + (prev === undefined ? 'first look ' : prev + ' -> ') + bad + ' of 2560' + (bad ? ' (first at ' + firstBad + ')' : ''));
 		if (bad && !prev && !nanHuntFound) { nanHuntFound = true; nanNote('NaN hunt: ' + bad + ' of 2560 samples of an HDR target turned NaN/Inf after ' + nanHuntLabel); }
-		if (bad && !prev && nanHuntDetails < 2) { nanHuntDetails++; try { await nanDetail(bx, by, gx, gy, w, h); } catch (e) { logLine('nanhunt detail failed: ' + e); } }
+		if (bad && !prev && nanHuntDetails < 2) {
+			nanHuntDetails++;
+			let detail = [];
+			try { detail = await nanDetail(bx, by, gx, gy, w, h); } catch (e) { logLine('nanhunt detail failed: ' + e); detail = ['detail failed: ' + e]; }
+			if (nanHuntDetails === 1 && !isNode) {		// everything needed to find the cause, for the page to copy: the device, the draw's inputs, the shaders
+				const info = adapter.info || {};
+				const report = ['GTA V browser runtime: NaN hunt report', 'GPU: ' + [info.vendor, info.architecture, info.device, info.description].filter(Boolean).join(' ') + ' | lacks: ' + (['texture-compression-bc', 'float32-filterable', 'depth32float-stencil8', 'rg11b10ufloat-renderable'].filter((f) => !device.features.has(f)).join(', ') || 'nothing'),
+					'Limits: textures/stage ' + device.limits.maxSampledTexturesPerShaderStage + ', inter-stage ' + device.limits.maxInterStageShaderVariables + ' | NaN rules ' + nanRules + ' | UA ' + self.navigator.userAgent,
+					'Target ' + r.tex + ' ' + w + 'x' + h + ' ' + t.format + ': ' + bad + ' of 2560 samples bad after ' + nanHuntLabel, '', ...detail, '',
+					'==== vertex shader ' + (nanHuntVs ? nanHuntVs.label : '-') + ' ====', nanHuntVs ? nanHuntVs.text : '', '==== pixel shader ' + (nanHuntPs ? nanHuntPs.label : '-') + ' ====', nanHuntPs ? nanHuntPs.text : ''].join('\n');
+				(gpuErrorChannel || (gpuErrorChannel = new BroadcastChannel('game-progress'))).postMessage({ nanReport: report });
+			}
+		}
 	}
 }
 
