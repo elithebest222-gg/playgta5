@@ -46,6 +46,9 @@
 	#hud { position: fixed; left: 8px; bottom: 8px; max-width: 60vw; white-space: pre-wrap; opacity: .8; pointer-events: none; z-index: 6; text-shadow: 0 0 3px #000, 1px 1px 1px #000; }		/* above the loading screen: errors there are seen */
 	#diag { position: fixed; right: 8px; top: 6px; max-width: 48vw; font: 11px/1.35 Consolas, monospace; color: #fc6; text-shadow: 0 0 3px #000, 1px 1px 1px #000; white-space: pre-wrap; text-align: right; pointer-events: none; z-index: 11; transition: opacity 1s; }
 	#diag.gone { opacity: 0; }
+	#diag-actions { position: fixed; right: 8px; top: 52px; display: flex; gap: 6px; z-index: 12; }
+	#diag-actions[hidden] { display: none; }
+	#diag-actions button, #diag-actions a { font: 12px/1 system-ui, sans-serif; padding: 6px 10px; border-radius: 4px; border: 1px solid #fc6; background: rgba(0, 0, 0, .75); color: #fc6; cursor: pointer; text-decoration: none; }
 	#toast { position: fixed; right: 16px; bottom: 16px; padding: 6px 12px; border-radius: 4px; background: rgba(0, 0, 0, .72); color: #fff; font: 13px system-ui, sans-serif; opacity: 0; transition: opacity .4s; pointer-events: none; z-index: 12; }
 	#toast.on { opacity: 1; }
 	#fps { position: fixed; left: 8px; top: 6px; display: none; color: #0f0; font: bold 18px/1.2 Consolas, monospace; font-variant-numeric: tabular-nums; text-shadow: 1px 1px 2px #000, 0 0 3px #000; pointer-events: none; z-index: 10; }
@@ -93,6 +96,7 @@
 <div id="loading" hidden><div id="ls-stage"><div id="ls-screens"></div><img id="ls-logo" alt=""><div id="ls-bars"><div id="modes" class="ls-bar"><button data-act="back"></button><button data-act="map5"></button><button data-act="map6"></button><button data-act="sandbox"></button><button data-act="story"></button></div><div class="ls-bar"><span id="label">Starting...</span><span id="pct">0%</span><i class="ls-spin"></i></div></div></div><div id="ls-log"><div id="data"></div><div id="console"></div></div><div id="bar"><div id="fill"></div></div></div>
 <div id="fps"></div>
 <div id="diag"></div>
+<div id="diag-actions" hidden><button id="diag-copy" type="button">Copy details for the developer</button><a id="diag-save" download="gta5-nan-report.txt">Save as file</a></div>
 <div id="toast"></div>
 <div id="setup">
 	<div class="card">
@@ -341,6 +345,20 @@ function showDiag(m) {
 	clearTimeout(diagTimer);
 	diagTimer = setTimeout(() => el.classList.add('gone'), diagErrors ? 90000 : 20000);
 }
+// The NaN hunt's full report (?nanhunt=1: the device, the bad draw's inputs and its shaders): copied or saved by the player and sent with the bug report. Press Esc
+// first to free the mouse from the game.
+function showNanReport(report) {
+	const box = document.getElementById('diag-actions'), copy = document.getElementById('diag-copy'), save = document.getElementById('diag-save');
+	console.log(report);
+	save.href = URL.createObjectURL(new Blob([report], { type: 'text/plain' }));
+	copy.onclick = () => navigator.clipboard.writeText(report).then(() => toast('Copied: paste it into your message'), () => toast('Copying failed: use "Save as file" instead'));
+	box.hidden = false;
+	const el = document.getElementById('diag');
+	el.textContent += '\nPress Esc to free the mouse, then copy the details or save them as a file and send them.';
+	el.classList.remove('gone');
+	clearTimeout(diagTimer);
+	box.style.top = Math.round(el.getBoundingClientRect().bottom + 6) + 'px';		// below the corner text, however many lines it has
+}
 let toastTimer = 0;
 function toast(text) {
 	const el = document.getElementById('toast');
@@ -381,6 +399,7 @@ function startProgress() {
 			return;
 		}
 		if (m.gpuInfo || m.gpuError) { showDiag(m); return; }
+		if (m.nanReport) { showNanReport(m.nanReport); return; }
 		if (m.saved !== undefined || m.userdataRestored !== undefined) { showSave(m); return; }
 		if (m.ioError) { hud.textContent = 'Game data: ' + m.ioError + '. Check that your game folder is complete and still in place, then reload the page.'; hud.style.color = '#f96'; return; }		// io_worker.js localError
 		if (m.gpuLost) { hud.textContent = 'The graphics device was lost (' + m.gpuLost + '): the screen will stay black. Reload the page.'; hud.style.color = '#f66'; return; }
