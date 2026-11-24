@@ -44,6 +44,10 @@
 	#bar { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: rgba(255, 255, 255, .08); }
 	#fill { height: 100%; width: 0; background: #7cc576; }
 	#hud { position: fixed; left: 8px; bottom: 8px; max-width: 60vw; white-space: pre-wrap; opacity: .8; pointer-events: none; z-index: 6; text-shadow: 0 0 3px #000, 1px 1px 1px #000; }		/* above the loading screen: errors there are seen */
+	#diag { position: fixed; right: 8px; top: 6px; max-width: 48vw; font: 11px/1.35 Consolas, monospace; color: #fc6; text-shadow: 0 0 3px #000, 1px 1px 1px #000; white-space: pre-wrap; text-align: right; pointer-events: none; z-index: 11; transition: opacity 1s; }
+	#diag.gone { opacity: 0; }
+	#toast { position: fixed; right: 16px; bottom: 16px; padding: 6px 12px; border-radius: 4px; background: rgba(0, 0, 0, .72); color: #fff; font: 13px system-ui, sans-serif; opacity: 0; transition: opacity .4s; pointer-events: none; z-index: 12; }
+	#toast.on { opacity: 1; }
 	#fps { position: fixed; left: 8px; top: 6px; display: none; color: #0f0; font: bold 18px/1.2 Consolas, monospace; font-variant-numeric: tabular-nums; text-shadow: 1px 1px 2px #000, 0 0 3px #000; pointer-events: none; z-index: 10; }
 
 	/* setup screen: the player brings their own game folder (nothing of the game is hosted here) */
@@ -75,6 +79,8 @@
 	#setup button:disabled { opacity: .45; cursor: default; }
 	#setup button[hidden] { display: none; }
 	#setup .hint { margin-top: 12px; color: #8a939c; font-size: 13px; }
+	#setup select { font: inherit; font-weight: 600; color: #e6e9ec; background: #1d2228; border: 1px solid #3a424c; border-radius: 8px; padding: 9px 12px; max-width: 100%; }
+	#setup .hint#quality-about { margin-top: 8px; }
 	#setup .fine { margin-top: 20px; padding-top: 14px; border-top: 1px solid #242a31; color: #6d767f; font-size: 12.5px; }
 	#setup .fine + .fine { margin-top: 8px; padding-top: 0; border-top: 0; }
 	#status:empty, #status-head:empty { display: none; }
@@ -86,12 +92,17 @@
 <div id="hud"></div>
 <div id="loading" hidden><div id="ls-stage"><div id="ls-screens"></div><img id="ls-logo" alt=""><div id="ls-bars"><div id="modes" class="ls-bar"><button data-act="back"></button><button data-act="map5"></button><button data-act="map6"></button><button data-act="sandbox"></button><button data-act="story"></button></div><div class="ls-bar"><span id="label">Starting...</span><span id="pct">0%</span><i class="ls-spin"></i></div></div></div><div id="ls-log"><div id="data"></div><div id="console"></div></div><div id="bar"><div id="fill"></div></div></div>
 <div id="fps"></div>
+<div id="diag"></div>
+<div id="toast"></div>
 <div id="setup">
 	<div class="card">
 		<h1>GTA V Browser Runtime</h1>
 		<p class="lead">The game runs entirely in your browser, from <b>your own copy</b> of the game files: the <code>mirror</code> folder (about 19.7 GB), or a .zip of it. This site does not host any game files.</p>
 		<h2>Your browser</h2>
 		<ul id="checks"><li class="wait">Checking…</li></ul>
+		<h2>Graphics</h2>
+		<div class="row"><select id="quality" aria-label="Graphics quality"></select></div>
+		<p class="hint" id="quality-about"></p>
 		<h2>Your game files</h2>
 		<div class="row">
 			<button id="resume" class="primary" hidden></button>
@@ -313,6 +324,38 @@ addEventListener('keydown', (e) => {
 	e.preventDefault(); e.stopImmediatePropagation();
 }, { capture: true });
 showModes();
+// ---- diagnostics and saves, from the workers on the same channel -------------------------------------------------------------------------------------------
+// The GPU worker reports the device (and what it lacks) and the first kinds of WebGPU errors: shown top right, so that a screenshot says what went wrong on a
+// device nobody here has. The io worker reports every save it stores (IndexedDB "gta5-userdata", see io_worker.js) and loader.js how many it put back at start.
+let diagInfo = '', diagErrors = '', diagTimer = 0;
+function showDiag(m) {
+	const el = document.getElementById('diag');
+	if (m.gpuInfo) {
+		const lack = m.gpuInfo.lacking.filter((f) => GPU_FEATURES.includes(f));
+		console.log('[page] GPU: ' + m.gpuInfo.name + (m.gpuInfo.lacking.length ? ', lacking ' + m.gpuInfo.lacking.join(', ') : ''));
+		diagInfo = lack.length ? 'GPU ' + m.gpuInfo.name + ' lacks ' + lack.join(', ') + ' (worked around)' : '';
+	}
+	if (m.gpuError) { console.warn('[page] GPU error: ' + m.gpuError); diagErrors += (diagErrors ? '\n' : '') + 'Graphics error ' + m.kinds + ': ' + m.gpuError; }
+	el.textContent = [diagInfo, diagErrors].filter(Boolean).join('\n');
+	el.classList.remove('gone');
+	clearTimeout(diagTimer);
+	diagTimer = setTimeout(() => el.classList.add('gone'), diagErrors ? 90000 : 20000);
+}
+let toastTimer = 0;
+function toast(text) {
+	const el = document.getElementById('toast');
+	el.textContent = text;
+	el.classList.add('on');
+	clearTimeout(toastTimer);
+	toastTimer = setTimeout(() => el.classList.remove('on'), 3500);
+}
+function showSave(m) {
+	if (m.userdataRestored !== undefined) { if (m.userdataRestored > 0) toast('Your saved game data was loaded'); return; }
+	console.log('[page] ' + (m.deleted ? 'save data deleted: ' : 'save data stored: ') + m.saved + (m.bytes ? ' (' + m.bytes + ' bytes)' : '') + (m.error ? ' FAILED: ' + m.error : ''));
+	if (m.error) toast('The game could not be saved in this browser: ' + m.error);
+	else if (!m.deleted && m.bytes >= 65536) toast('Game saved');		// savegames (~0.5 MB); settings files are small
+}
+
 // ---- loading progress: the engine (prejs.js, loader.js) and the GPU worker publish {pct, label} on a BroadcastChannel ------------------
 function startProgress() {
 	const loading = document.getElementById('loading'), fill = document.getElementById('fill'), label = document.getElementById('label'), pct = document.getElementById('pct');
@@ -337,6 +380,8 @@ function startProgress() {
 			dirty = true;
 			return;
 		}
+		if (m.gpuInfo || m.gpuError) { showDiag(m); return; }
+		if (m.saved !== undefined || m.userdataRestored !== undefined) { showSave(m); return; }
 		if (m.ioError) { hud.textContent = 'Game data: ' + m.ioError + '. Check that your game folder is complete and still in place, then reload the page.'; hud.style.color = '#f96'; return; }		// io_worker.js localError
 		if (m.gpuLost) { hud.textContent = 'The graphics device was lost (' + m.gpuLost + '): the screen will stay black. Reload the page.'; hud.style.color = '#f66'; return; }
 		if (m.error) { label.textContent = m.error; label.style.color = '#e66'; return; }
@@ -415,6 +460,23 @@ if (remoteLog) {
 }
 // Release the io worker's exclusive storage handles as soon as this page goes away (a quick reload would otherwise find them locked and run without the store).
 addEventListener('pagehide', () => { try { new BroadcastChannel('game-io').postMessage('close'); } catch (e) {} });
+// ---- graphics presets --------------------------------------------------------------------------------------------------------------------------------------------
+// Chosen on the setup screen (remembered), or ?quality=fast|balanced|full. The engine settings are the ones the port's own low-memory profile uses (measured there in a
+// Node run at the world: the cascade shadow pass was a third of all draws, and a 4-core Chromebook's GPU worker spent ~110 us per draw), so Fast mostly cuts the number
+// of draws; the render scale cuts the pixels. Nothing here touches shader quality: its low setting selects shaders (win32_40_lq) this port has no translation of.
+const LOW_ARGS = () => ['-textureQuality=0', '-pedVariety=0', '-vehicleVariety=0', '-shadowQuality=' + (q.get('shadows') === '1' ? 0 : -1), '-reflectionQuality=0', '-particleQuality=0',
+	'-grassQuality=0', '-cityDensity=0', '-lodScale=0', '-pedLodBias=0', '-vehicleLodBias=0'];
+const QUALITY = {
+	fast: { label: 'Fast', scale: 0.7, cap: [1280, 720], fewerThreads: true, args: LOW_ARGS,
+		about: '70 % resolution (at most 1280x720), no shadows or reflections, fewer people and cars, shorter draw distance, lower texture detail. For Chromebooks and older computers.' },
+	balanced: { label: 'Balanced', scale: 0.85, cap: [1920, 1080], fewerThreads: false, args: () => ['-shadowQuality=0', '-reflectionQuality=0', '-particleQuality=0', '-grassQuality=0', '-cityDensity=0', '-lodScale=0'],
+		about: '85 % resolution, the simplest shadows, no reflections, fewer people and cars, full textures. For most laptops.' },
+	full: { label: 'Full', scale: 1, cap: [3840, 2160], fewerThreads: false, args: () => [],
+		about: 'Native resolution and the game\'s own default settings. For gaming PCs.' },
+};
+// The device's default: Fast on a Chromebook or with 4 GB or less, Balanced with 4 or fewer CPU threads, Full otherwise
+const QUALITY_DEFAULT = /\bCrOS\b/.test(navigator.userAgent) || (navigator.deviceMemory && navigator.deviceMemory <= 4) ? 'fast' : navigator.hardwareConcurrency <= 4 ? 'balanced' : 'full';
+let quality = QUALITY[q.get('quality')] ? q.get('quality') : (() => { try { const v = localStorage.getItem('gta5-quality'); return QUALITY[v] ? v : QUALITY_DEFAULT; } catch (e) { return QUALITY_DEFAULT; } })();
 let lowMemory = false;		// set in startEngine (module scope: the ?mem readout also needs it)
 let startSize = [1280, 720], wantSize = null;		// set in startEngine (module scope: installInput uses them)
 // The engine itself: `local` is what loader.js needs to read the game from the player's folder (see prepareFolder).
@@ -428,19 +490,23 @@ function startEngine(local) {
 	// 600-900 of 1,300-2,900 per frame), and a 4-core Chromebook spent ~110 us per draw. ?shadows=1 keeps them at the lowest level.
 	const lowParam = q.get('low');
 	lowMemory = lowParam === '1' || (lowParam !== '0' && navigator.deviceMemory && navigator.deviceMemory <= 4);
-	const LOW_ARGS = ['-textureQuality=0', '-pedVariety=0', '-vehicleVariety=0', '-shadowQuality=' + (q.get('shadows') === '1' ? 0 : -1), '-reflectionQuality=0', '-particleQuality=0',
-		'-grassQuality=0', '-cityDensity=0', '-lodScale=0', '-pedLodBias=0', '-vehicleLodBias=0'];
-	const cores = +(q.get('cores') || 0) || (lowMemory ? 2 : navigator.hardwareConcurrency);
+	// The graphics preset (setup screen; ?quality=fast|balanced|full). The low-memory profile is Fast with its memory limits.
+	const preset = QUALITY[lowMemory ? 'fast' : quality];
+	const QUALITY_ARGS = lowMemory ? LOW_ARGS() : preset.args();
+	// Fewer engine threads on a CPU with 4 or fewer: the engine sizes its worker pools from the core count, and on a Chromebook those threads compete with the main
+	// thread and the GPU worker, which set the frame rate (in the low-memory profile, 2 cores = 54 threads instead of 80-116, ~20 MB each)
+	const cores = +(q.get('cores') || 0) || (lowMemory || (preset.fewerThreads && navigator.hardwareConcurrency <= 4) ? 2 : navigator.hardwareConcurrency);
 	if (lowMemory) hud.textContent = 'Low-memory device (' + (navigator.deviceMemory || '?') + ' GB reported): close other tabs. If the tab shows "Aw, Snap!" or SIGILL it ran out of memory.';
-	postLog('[page env] ' + JSON.stringify({ deviceMemory: navigator.deviceMemory, cores: navigator.hardwareConcurrency, usingCores: cores, low: lowMemory, isolated: crossOriginIsolated, ua: navigator.userAgent.slice(0, 120), screen: screen.width + 'x' + screen.height + '@' + devicePixelRatio }));
-	// Back buffer = the browser window in device pixels (native resolution), following window resizes live (see installInput). ?scale=0.75 renders at 75 % (faster), ?fixed=1 keeps the
-	// start-up size whatever the window does, ?res=1920x1080 forces a size. Even numbers, at most 3840x2160 (2560x1440 in the low-memory profile: screen-sized render targets dominate GPU memory).
+	postLog('[page env] ' + JSON.stringify({ deviceMemory: navigator.deviceMemory, cores: navigator.hardwareConcurrency, usingCores: cores, low: lowMemory, quality: preset.label, isolated: crossOriginIsolated, ua: navigator.userAgent.slice(0, 120), screen: screen.width + 'x' + screen.height + '@' + devicePixelRatio }));
+	// Back buffer = the browser window in device pixels times the preset's scale (Full: native resolution), following window resizes live (see installInput); the canvas
+	// is stretched to the window. ?scale=0.75 sets the scale, ?fixed=1 keeps the start-up size whatever the window does, ?res=1920x1080 forces a size. Even numbers, at
+	// most the preset's cap (3840x2160 for Full; 2560x1440 in the low-memory profile: screen-sized render targets dominate GPU memory).
 	wantSize = () => {
 		const forced = /^(\d+)x(\d+)$/.exec(q.get('res') || '');
 		if (forced) return [+forced[1], +forced[2]];
-		const sc = Math.max(0.25, Math.min(2, +(q.get('scale') || 1)));
+		const sc = Math.max(0.25, Math.min(2, +(q.get('scale') || preset.scale)));
 		let w = innerWidth * devicePixelRatio * sc, h = innerHeight * devicePixelRatio * sc;
-		const cap = lowMemory ? [2560, 1440] : [3840, 2160], k = Math.min(1, cap[0] / w, cap[1] / h);
+		const cap = lowMemory ? [Math.min(2560, preset.cap[0]), Math.min(1440, preset.cap[1])] : preset.cap, k = Math.min(1, cap[0] / w, cap[1] / h);
 		w *= k; h *= k;
 		return [Math.max(320, Math.round(w / 2) * 2), Math.max(240, Math.round(h / 2) * 2)];
 	};
@@ -468,7 +534,7 @@ function startEngine(local) {
 		base: BASE,
 		local,		// the player's folder: loader.js reads game.wasm, the data and the shaders from these Files instead of the host
 		args: ['-rootdir=/game/', ...(q.get('nogpu') ? [] : ['-wgpu']), '-nodisplaycalibration', '-noSocialClub', '-pc:nosocialclub', ...(q.get('newgame') === '1' ? ['-noautoload'] : []), '-nonetwork', '-output', '-width=' + startSize[0], '-height=' + startSize[1], '-forceResolution', ...LOG_ARGS, ...ENGINE_ARGS, '-frameLimit=' + (q.get('fps') === '30' ? 2 : q.get('fps') === '0' ? 0 : 1),		// the game's own limiter: VSync 2 (its default) = 30 fps; 1 = 60 fps; ?fps=0 uncapped (diagnostics). Story Mode continues from the newest savegame (the engine skips that for Sandbox Mode); ?newgame=1 (-noautoload) starts it from the Prologue instead
-			...(cores <= 2 ? ['-numCores=' + cores] : []), ...(lowMemory ? LOW_ARGS : []), ...(q.get('args') || '').split(',').filter(Boolean)],
+			...(cores <= 2 ? ['-numCores=' + cores] : []), ...QUALITY_ARGS, ...(q.get('args') || '').split(',').filter(Boolean)],
 		shotEvery: +(q.get('shot') || 0),
 		shotRt: q.get('shotrt') === '1',		// ?shotrt=1 (with ?shot=N): every render target of one frame after the world is shown to the dev server's shots/ (wgpu_worker.js)
 		noHints: q.get('nohints') === '1',		// ?nohints=1: do not fetch the streamer's queued reads ahead (io_worker.js drainHints; diagnostics)
@@ -689,6 +755,7 @@ class FolderError extends Error {}		// a problem with the folder itself: shown a
 
 // Browser checks. Cross-origin isolation comes from coi-serviceworker.js: on a first visit it is not there yet, and the page reloads by itself in a moment.
 let env = { isolated: crossOriginIsolated, gpu: null, problems: [] };
+const GPU_FEATURES = ['texture-compression-bc', 'float32-filterable', 'depth32float-stencil8', 'rg11b10ufloat-renderable'];		// optional WebGPU features the renderer uses (wgpu_worker.js)
 async function checkBrowser() {
 	const rows = [];
 	env.problems = [];
@@ -703,7 +770,15 @@ async function checkBrowser() {
 	let adapter = null;
 	try { adapter = navigator.gpu ? await navigator.gpu.requestAdapter() : null; } catch (e) { adapter = null; }
 	env.gpu = !!adapter;
-	if (adapter) rows.push(['ok', 'WebGPU']);
+	if (adapter) {
+		const info = adapter.info || {}, name = [info.vendor, info.architecture, info.description].filter(Boolean).join(' ');
+		const lacking = GPU_FEATURES.filter((f) => !adapter.features.has(f));
+		if (lacking.includes('texture-compression-bc')) {
+			rows.push(['bad', 'WebGPU' + (name ? ': ' + name : ''), 'This GPU cannot use the game\'s compressed textures (texture-compression-bc): most surfaces would not show.']);
+			env.problems.push('no compressed textures on this GPU');
+		} else if (lacking.length) rows.push(['ok', 'WebGPU' + (name ? ': ' + name : ''), 'It lacks ' + lacking.join(', ') + ': the game works around that, with slightly lower precision.']);
+		else rows.push(['ok', 'WebGPU' + (name ? ': ' + name : '')]);
+	}
 	else rows.push(['bad', 'WebGPU', navigator.gpu ? 'WebGPU is present but found no usable graphics adapter: update your graphics driver, or check chrome://gpu.' : 'Not available in this browser: use a recent Chrome or Edge on a desktop computer.']);
 	if (!adapter) env.problems.push('WebGPU');
 	const threads = typeof OffscreenCanvas !== 'undefined' && typeof Atomics.waitAsync === 'function' && typeof HTMLCanvasElement.prototype.transferControlToOffscreen === 'function';
@@ -1104,6 +1179,8 @@ function startGame(prep) {
 	if (spinner) document.documentElement.style.setProperty('--ls-spinner', 'url(' + spinner + ')');
 	else document.documentElement.classList.add('no-spinner-art');
 	if (font) { const face = new FontFace('Chalet', 'url(' + font + ') format("woff")'); document.fonts.add(face); face.load().catch(() => {}); }
+	// Saves live in this site's IndexedDB: ask the browser to keep it when the disk fills up (on a Chromebook holding a 20 GB zip, best-effort storage can be cleared)
+	if (navigator.storage && navigator.storage.persist) navigator.storage.persist().then((ok) => console.log('[page] persistent storage for saves: ' + (ok ? 'granted' : 'not granted')), () => {});
 	setupEl.remove();
 	$('loading').hidden = false;
 	startTitle();
@@ -1168,6 +1245,15 @@ if (canPickDir) recallFolder().then((saved) => {
 	};
 });
 if (!canPickDir) $('pick-hint').append(' Your browser will list the whole folder first, which can take a moment.');
+{		// the graphics preset choice (QUALITY above), remembered for the next visit
+	const sel = $('quality'), about = $('quality-about');
+	for (const [k, v] of Object.entries(QUALITY)) sel.append(new Option(v.label + (k === QUALITY_DEFAULT ? ' (recommended for this device)' : ''), k));
+	const lowMem = q.get('low') === '1' || (q.get('low') !== '0' && navigator.deviceMemory && navigator.deviceMemory <= 4);
+	const show = () => { about.textContent = QUALITY[sel.value].about + (lowMem && sel.value !== 'fast' ? ' This device reports little memory: the game uses Fast settings anyway.' : ''); };
+	sel.value = quality;
+	show();
+	sel.onchange = () => { quality = sel.value; show(); try { localStorage.setItem('gta5-quality', quality); } catch (e) { /* not remembered */ } };
+}
 const browserChecked = checkBrowser();
 </script>
 </body>

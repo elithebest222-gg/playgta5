@@ -40,11 +40,17 @@ The site only hosts the runtime scripts (`index.html`, `loader.js`, `game.js` an
 3. The page checks your files against the game's file list and starts the game. If something is missing or looks incomplete, it tells you what, and you can still try with **Start anyway**.
 4. On your next visit, Chrome and Edge remember the folder or zip, so you only need to click **Continue with …**.
 
+**Graphics (speed):** the setup screen has a **Graphics** choice. **Fast** is picked automatically on Chromebooks: 70 % resolution, no shadows or reflections, fewer people and cars, shorter draw distance. It removes a large part of the work per frame (shadows alone are about a third of everything drawn). **Balanced** and **Full** look better but need a stronger computer. The choice is remembered. Press `=` in the game to show the frame rate.
+
+**Saving:** saves are kept in your browser for this site, and a "Game saved" notice shows each time the game saves. Story Mode saves by itself after each mission, but the first mission (the prologue) has to be finished before the first save. The next time you play, Story Mode continues from your newest save.
+
 You don't have to use GitHub Pages: any web server works too. For example, run `python -m http.server 8000 --bind 127.0.0.1` in this folder and open `http://localhost:8000/`.
 
 **If something goes wrong:**
 - *Cross-origin isolation* is marked ✕: reload the page. Don't use a private window, and open the site over `https://`, not as a file on your disk.
 - *WebGPU* is marked ✕: update your browser and graphics driver (`chrome://gpu` shows what's wrong).
+- The picture looks wrong (too bright, black, missing things): yellow text in the top-right corner names the graphics errors. Take a screenshot of it, plus one of the setup screen (it shows your GPU), when you report the problem.
+- It runs slowly: choose **Fast** under Graphics on the setup screen, close other tabs, and keep a Chromebook plugged in.
 - The game stops with "could not read … from your game folder": the folder or zip was moved, or some files are missing. Reload and pick it again.
 - "Big game files are compressed inside the zip": the game reads small pieces from the middle of its big files, which a compressed zip can't give it. Zips made with no compression (like `playgta5-offline-2026-10-06.zip`) work in place. For a compressed zip, either extract it and pick the extracted folder, or make the zip again without compression (7-Zip: compression level "Store").
   - On a Chromebook, you can skip extracting: open the zip in the Files app (it opens like a folder), then use **Choose your mirror folder** and pick the `mirror` folder inside it.
