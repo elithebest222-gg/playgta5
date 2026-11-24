@@ -141,13 +141,26 @@ let noF32Filter = false, noD32S8 = false, noRG11 = false;
 let mem = null, memBuffer = null, i32 = null, u32 = null, f32 = null, u8 = null, ringBase = 0, ringSize = 0;
 let canvas = null, canvasCtx = null, canvasFormat = null, blit = null, canvasConfigured = false;
 let fpsChannel = null, fpsOverlayN = 0, fpsOverlayT = 0;
+const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0 };		// the frame-rate overlay's sums since its last report (present)
+// The GPU's share of a frame (the overlay's "GPU"): the time during which some submitted work is not finished yet, from the submit to the moment this worker learns that the
+// newest submit is done (its event loop gets a turn at least every 2 ms). It includes the GPU process's own work on the commands, so it is a little long, never short.
+let gpuSeq = 0, gpuDoneSeq = 0, gpuBusyT0 = 0;
+function gpuTrack() {
+	const seq = ++gpuSeq;
+	if (seq === gpuDoneSeq + 1) gpuBusyT0 = performance.now();		// everything before was done: the GPU is busy from now
+	device.queue.onSubmittedWorkDone().then(() => {
+		if (seq <= gpuDoneSeq) return;
+		gpuDoneSeq = seq;
+		if (seq === gpuSeq) ov.gpu += performance.now() - gpuBusyT0;		// nothing newer outstanding: idle from now
+	});
+}
 let encoder = null, pass = null, passKey = '';
 let errorCount = 0, errorCount0 = 0, clampedDraws = 0, clampedDraws0 = 0, gpuErrorChannel = null;
 const errorKinds = new Map();		// normalised message -> { n, msg }
 function dumpErrors() { for (const [k, e] of [...errorKinds].sort((a, b) => b[1].n - a[1].n).slice(0, 15)) logLine('  error x' + e.n + ': ' + e.msg.slice(0, 300)); }
 let drawCount = 0, skippedDraws = 0;
 let lastPresentDraws = 0, progressChannel = null, worldSent = false;
-let lastFitPl = '';		// the shader pair of the last draw that needed texture-limit variants (fitTextures): a change forces a pipeline lookup
+let lastFitVs = null, lastFitPs = null;		// the shader pair of the last draw that needed texture-limit variants (fitTextures): a change forces a pipeline lookup
 let worldSince = 0, worldClean = 0, worldSkips0 = 0, worldNoteT = 0, skipsAtPresent = 0;		// present(): the title screen stays up until frames stop skipping draws
 // id -> object (texture, buffer, shader, layout, srv, state); ids are unique across kinds. Ids come from one counter in wgpu_backend.cpp (AllocId) and are never reused, so a plain
 // array indexed by id holds them (dense, small gaps): a draw looks up ~15 objects, and an element load is several times cheaper than Map.get.
@@ -191,7 +204,7 @@ function flush(reason) {
 	endPass();
 	if (dirtyChunks.size) flushUniforms();
 	const resolves = pendingResolve.length ? recordResolves() : null;		// into this encoder: no command buffer of its own
-	if (encoder) { device.queue.submit([encoder.finish()]); encoder = null; onSubmitted(); submits++; counterSlot = 0; }
+	if (encoder) { device.queue.submit([encoder.finish()]); encoder = null; onSubmitted(); submits++; counterSlot = 0; if (!isNode) gpuTrack(); }
 	if (resolves) mapResolves(resolves);
 	fr.flush += performance.now() - tf0;
 	usedInEncoder.clear();
@@ -540,19 +553,36 @@ function dropTexture(text, b) {
 	}
 	return out + text.slice(last);
 }
-// The variant of program prog (of shader object obj, at stage) for the textures bound now: { obj, prog }, or null when it cannot be made to fit
+// The variant of program prog (of shader object obj, at stage) for the textures bound now: { obj, prog }, or null when it cannot be made to fit. Per draw only a loop over
+// the droppable bindings: which of them are bound now (a bit mask) picks the variant from a cache; lists, sorting and the variant itself only the first time for a mask.
 function fitTextures(obj, prog, stage) {
-	const limit = device.limits.maxSampledTexturesPerShaderStage || 16;
-	const texs = prog.info.bindings.filter((b) => b.kind === 'texture'), need = texs.length - limit;
-	const isBound = (b) => { const id = S.srv[stage][b.binding - 32], srv = id ? objs.get(id) : null, t = srv && !srv.isBuf ? objs.get(srv.res) : null; return !!(t && t.kind === 'texture'); };
-	const byHigh = (a, b) => b.binding - a.binding;
-	const empty = texs.filter((b) => b.droppable && !isBound(b)).sort(byHigh);
+	let f = prog.fit;
+	if (!f) {
+		const limit = device.limits.maxSampledTexturesPerShaderStage || 16;
+		const texs = prog.info.bindings.filter((b) => b.kind === 'texture');
+		const cand = texs.filter((b) => b.droppable).sort((a, b) => b.binding - a.binding).slice(0, 30);		// highest binding first: those go first
+		f = prog.fit = { limit, texs, need: texs.length - limit, cand, byMask: new Map() };
+		if (cand.length < f.need) logOnce('fit' + prog.label, 'shader ' + prog.label + ' reads ' + texs.length + ' textures (this GPU allows ' + limit + ') and cannot be reduced: its draws are skipped');
+	}
+	if (f.cand.length < f.need) return null;
+	const srvs = S.srv[stage];
+	let mask = 0;
+	for (let i = 0; i < f.cand.length; i++) {
+		const id = srvs[f.cand[i].binding - 32], srv = id ? objs.get(id) : null, t = srv && !srv.isBuf ? objs.get(srv.res) : null;
+		if (t && t.kind === 'texture') mask |= 1 << i;
+	}
+	let v = f.byMask.get(mask);
+	if (v === undefined) { v = fitVariant(obj, prog, f, mask); f.byMask.set(mask, v); }
+	return v;
+}
+function fitVariant(obj, prog, f, mask) {
+	const { limit, texs, need, cand } = f;
+	const empty = cand.filter((b, i) => !((mask >>> i) & 1));
 	let drop = empty.slice(0, need), lossy = [];
 	if (drop.length < need) {
-		lossy = texs.filter((b) => b.droppable && isBound(b)).sort(byHigh).slice(0, need - drop.length);
+		lossy = cand.filter((b, i) => (mask >>> i) & 1).slice(0, need - drop.length);
 		drop = drop.concat(lossy);
 	}
-	if (drop.length < need) { logOnce('fit' + prog.label, 'shader ' + prog.label + ' reads ' + texs.length + ' textures (this GPU allows ' + limit + ') and cannot be reduced: its draws are skipped'); return null; }
 	drop.sort((a, b) => a.binding - b.binding);
 	const key = drop.map((b) => b.binding).join(',');
 	const cache = prog.texVariants || (prog.texVariants = new Map());
@@ -1961,8 +1991,8 @@ function doDraw(p) {
 		if ((vsProg.overTex && !vv) || (psProg && psProg.overTex && !pv)) { skipDraw('texture limit'); return; }
 		if (vv) { vsObj = vv.obj; vsProg = vv.prog; }
 		if (pv) { psObj = pv.obj; psProg = pv.prog; }
-		if (lastFitPl !== vsObj.hash + '|' + (psObj ? psObj.hash : '')) { lastFitPl = vsObj.hash + '|' + (psObj ? psObj.hash : ''); pdirty = true; }
-	} else if (lastFitPl) { lastFitPl = ''; pdirty = true; }
+		if (lastFitVs !== vsObj || lastFitPs !== psObj) { lastFitVs = vsObj; lastFitPs = psObj; pdirty = true; }
+	} else if (lastFitVs) { lastFitVs = lastFitPs = null; pdirty = true; }
 	prepareDepthProxies(vsProg, 0);
 	if (psProg) prepareDepthProxies(psProg, 1);
 	if (!ensurePass()) { skipDraw('if (!ensurePass()) { skippedDraws++; return; }'); return; }
@@ -2953,6 +2983,7 @@ async function present(id) {
 			}
 		}
 		lastPresentT = tn;
+		ov.idle += fr.idle; ov.wait += fr.wait; ov.pipe += fr.pipe; ov.up += fr.up;		// the page's frame-rate overlay (below)
 		fr.idle = fr.pipe = fr.mod = fr.up = fr.upBytes = fr.wait = fr.flush = 0;
 	}
 	{	// every 10 s: frame rate and work per frame (visible in the session log)
@@ -2981,14 +3012,17 @@ async function present(id) {
 			dbgChannel.postMessage({ limit: Atomics.load(i32, dbgIdx), total: Atomics.load(i32, dbgIdx + 1), last: dbgLastLabel });
 		}
 	}
-	if (!isNode) {		// the page's FPS counter (index.html, '=' key): presented frames per second, twice a second
+	if (!isNode) {		// the page's FPS counter (index.html, '=' key): presented frames per second, twice a second, and where a frame's time went (per frame): this worker waiting
+		// for the game's commands (idle), waiting for the GPU (wait: a frame slot or a fence), working (the rest: translating draws), and how long the GPU had work (gpu, see gpuTrack)
 		const tn = performance.now();
 		fpsOverlayN++;
-		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; }
+		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.gpu = 0; ov.draws = drawCount; }
 		else if (tn - fpsOverlayT >= 500) {
 			if (!fpsChannel) fpsChannel = new BroadcastChannel('game-fps');
-			fpsChannel.postMessage({ fps: fpsOverlayN * 1000 / (tn - fpsOverlayT) });
-			fpsOverlayN = 0; fpsOverlayT = tn;
+			if (gpuDoneSeq < gpuSeq) { ov.gpu += tn - gpuBusyT0; gpuBusyT0 = tn; }		// the GPU is still busy: its time so far counts now
+			const n = Math.max(1, fpsOverlayN), ms = (tn - fpsOverlayT) / n;
+			fpsChannel.postMessage({ fps: fpsOverlayN * 1000 / (tn - fpsOverlayT), ms, draws: (drawCount - ov.draws) / n, idle: ov.idle / n, wait: ov.wait / n, pipe: ov.pipe / n, up: ov.up / n, gpu: Math.min(ms, ov.gpu / n) });
+			fpsOverlayN = 0; fpsOverlayT = tn; ov.idle = ov.wait = ov.pipe = ov.up = ov.gpu = 0; ov.draws = drawCount;
 		}
 	}
 	{	// loading progress for the page (phase3/index.html): first frame, then the world. The world starts with the first frame with a real scene (loading screens draw ~10
@@ -3088,7 +3122,9 @@ async function runCommands(tail, head) {
 		case 7 /* PRESENT */: await present(u32[p]); refreshViews(); break;
 		case 8 /* FENCE */: {
 			flush('fence');
+			const tw = performance.now();
 			await device.queue.onSubmittedWorkDone();
+			fr.wait += performance.now() - tw;		// the engine waits for the GPU here (the overlay's "waiting for the GPU")
 			refreshViews();
 			const addr = u32[p] + u32[p + 1] * 4294967296;
 			Atomics.store(i32, w32(addr), u32[p + 2] | 0);
