@@ -89,23 +89,25 @@
 <div id="setup">
 	<div class="card">
 		<h1>GTA V Browser Runtime</h1>
-		<p class="lead">The game runs entirely in your browser, from <b>your own copy</b> of the game files: the <code>mirror</code> folder (about 19.7 GB). This site does not host any game files.</p>
+		<p class="lead">The game runs entirely in your browser, from <b>your own copy</b> of the game files: the <code>mirror</code> folder (about 19.7 GB), or a .zip of it. This site does not host any game files.</p>
 		<h2>Your browser</h2>
 		<ul id="checks"><li class="wait">Checking…</li></ul>
-		<h2>Your game folder</h2>
+		<h2>Your game files</h2>
 		<div class="row">
 			<button id="resume" class="primary" hidden></button>
 			<button id="choose" class="primary" disabled>Choose your mirror folder</button>
+			<button id="choose-zip" disabled>Choose a .zip instead</button>
 			<button id="start-anyway" hidden>Start anyway</button>
 		</div>
-		<p class="hint" id="pick-hint">Pick the folder named <code>mirror</code> (it contains <code>playgta5.com</code>), or the <code>playgta5.com</code> folder itself. You can also drag the folder onto this page.</p>
+		<p class="hint" id="pick-hint">Pick the folder named <code>mirror</code> (it contains <code>playgta5.com</code>), or the <code>playgta5.com</code> folder itself. A .zip with that folder inside works too, with no need to extract it. You can also drag the folder or the zip onto this page.</p>
 		<p class="hint" id="status-head" aria-live="polite"></p>
 		<ul id="status" aria-live="polite"></ul>
-		<p class="fine">Your files are read straight from your disk by this page and never leave your computer. If the browser asks whether to “upload” them, that is only its standard wording for letting a page read a folder: nothing is sent anywhere.</p>
+		<p class="fine">Your files are read straight from your disk by this page and never leave your computer. If the browser asks whether to “upload” them, that is only its standard wording for letting a page read a folder or file: nothing is sent anywhere.</p>
 		<p class="fine">Works best in a recent Chrome or Edge on a desktop computer with 8 GB of memory or more. Close other tabs before you start.</p>
 	</div>
 </div>
 <input type="file" id="folder-input" webkitdirectory multiple hidden>
+<input type="file" id="zip-input" accept=".zip,application/zip,application/x-zip-compressed" hidden>
 <script type="module">
 // Page of the browser build. The engine runs in a dedicated worker (loader.js: its "main thread", where the static constructors and
 // main() run and which may block); the page only owns the canvas, which is transferred to that worker and on to the GPU worker.
@@ -669,8 +671,9 @@ function installInput(memory, block) {
 // folder is remembered (IndexedDB) and the next visit needs one click; elsewhere an <input webkitdirectory> lists the whole folder.
 const $ = (id) => document.getElementById(id);
 const setupEl = $('setup'), checksEl = $('checks'), statusEl = $('status'), statusHead = $('status-head');
-const chooseBtn = $('choose'), resumeBtn = $('resume'), anywayBtn = $('start-anyway'), folderInput = $('folder-input');
-const canPickDir = typeof showDirectoryPicker === 'function';
+const chooseBtn = $('choose'), zipBtn = $('choose-zip'), resumeBtn = $('resume'), anywayBtn = $('start-anyway'), folderInput = $('folder-input'), zipInput = $('zip-input');
+const canPickDir = typeof showDirectoryPicker === 'function', canPickFile = typeof showOpenFilePicker === 'function';
+const setPicking = (on) => { chooseBtn.disabled = zipBtn.disabled = resumeBtn.disabled = !on; };
 const fmtN = (n) => n.toLocaleString('en-US');
 const count = (n, one, many) => fmtN(n) + ' ' + (n === 1 ? one : many);
 const fmtBytes = (n) => (n >= 1073741824 ? (n / 1073741824).toFixed(1) + ' GB' : n >= 1048576 ? (n / 1048576 | 0) + ' MB' : Math.ceil(n / 1024) + ' KB');
@@ -689,7 +692,7 @@ let env = { isolated: crossOriginIsolated, gpu: null, problems: [] };
 async function checkBrowser() {
 	const rows = [];
 	env.problems = [];
-	chooseBtn.disabled = resumeBtn.disabled = busy || !crossOriginIsolated;
+	setPicking(!busy && crossOriginIsolated);
 	if (crossOriginIsolated) rows.push(['ok', 'Cross-origin isolation (shared memory for the engine threads)']);
 	else if (location.protocol === 'file:') rows.push(['bad', 'Cross-origin isolation', 'This page cannot run from a file on your disk: open it from its web address (GitHub Pages), or run Launch-Local.cmd.']);
 	else if (!isSecureContext) rows.push(['bad', 'Cross-origin isolation', 'Open this page over https:// (or http://localhost): the browser only allows it there.']);
@@ -712,15 +715,15 @@ async function checkBrowser() {
 	if (!crossOriginIsolated && navigator.serviceWorker && !navigator.serviceWorker.controller && performance.now() < 8000) setTimeout(checkBrowser, 8000 - performance.now() + 100);
 }
 
-// The remembered folder (File System Access API: a directory handle can be stored in IndexedDB; the browser asks again for permission to read it).
+// The remembered folder or zip (File System Access API: a directory or file handle can be stored in IndexedDB; the browser asks again for permission to read it).
 const handleDb = () => new Promise((resolve, reject) => {
 	const r = indexedDB.open('gta5-game-folder', 1);
 	r.onupgradeneeded = () => r.result.createObjectStore('handles');
 	r.onsuccess = () => resolve(r.result);
 	r.onerror = () => reject(r.error);
 });
-async function rememberFolder(dir) {
-	try { const db = await handleDb(); db.transaction('handles', 'readwrite').objectStore('handles').put(dir, 'folder'); } catch (e) { /* not remembered: picked again next time */ }
+async function rememberFolder(handle) {
+	try { const db = await handleDb(); db.transaction('handles', 'readwrite').objectStore('handles').put(handle, 'folder'); } catch (e) { /* not remembered: picked again next time */ }
 }
 async function forgetFolder() {
 	try { const db = await handleDb(); db.transaction('handles', 'readwrite').objectStore('handles').delete('folder'); } catch (e) {}
@@ -732,15 +735,17 @@ async function recallFolder() {
 	} catch (e) { return null; }
 }
 
-// ---- reading a folder: a directory handle (showDirectoryPicker, drag and drop) or a file list (<input webkitdirectory>) -> a source:
-// { where: path of the game's root in the picked folder, build, data: Map path under data/ -> File or FileSystemFileHandle, title: the same for the build's title/
-//   folder, buildFile(path under the build folder) -> Promise<File | null>, shaderFiles: Map name -> File of the build's shaders folder (file lists only),
-//   shaderDir: its directory handle (handles only), partials: unfinished downloads (*.part) under data/ }
-const fileOf = async (x) => (x && typeof x.getFile === 'function' ? x.getFile() : x || null);
-async function subdirs(dir) {
-	const out = new Map();
-	for await (const [name, h] of dir.entries()) if (h.kind === 'directory') out.set(name, h);
-	return out;
+// ---- reading a folder: a directory handle (showDirectoryPicker, drag and drop) or a file list (<input webkitdirectory>), or a zip (see below) -> a source:
+// { where: path of the game's root in what was picked, build, data: Map path under data/ -> File, FileSystemFileHandle or ZipEntry, title: the same for the
+//   build's title/ folder, buildFile(path under the build folder) -> Promise<File | Blob | null>, shaderFiles: Map name -> File of the build's shaders folder
+//   (file lists only), shaderDir: its directory handle (handles only), partials: unfinished downloads (*.part) under data/ }
+const fileOf = async (x) => (x instanceof ZipEntry ? x.blob() : x && typeof x.getFile === 'function' ? x.getFile() : x || null);
+const dataFileOf = (x) => (x instanceof ZipEntry ? x.lazy() : fileOf(x));		// game data: what the io worker reads (see ZipEntry.lazy)
+const isZip = (name) => /\.zip$/i.test(name);
+async function children(dir) {		// the folders in dir, and its zips (a folder holding the zip of the mirror instead of the mirror)
+	const dirs = new Map(), zips = [];
+	for await (const [name, h] of dir.entries()) { if (h.kind === 'directory') dirs.set(name, h); else if (isZip(name)) zips.push(h); }
+	return { dirs, zips };
 }
 async function lookup(dir, path) {		// a file handle at path under dir, or null
 	try {
@@ -759,29 +764,43 @@ async function walk(dir, prefix, out, onCount) {		// every file under dir: out.s
 	await Promise.all(dirs.map(([name, h]) => walk(h, prefix + name + '/', out, onCount)));
 }
 const builds = (names) => [...names].sort((a, b) => (b === BUILD) - (a === BUILD));		// this page's build first
-function notFound(name) {
+function notFound(name, zip) {
 	const n = name.toLowerCase();
+	if (zip) return new FolderError('“' + name + '” does not contain the game files: no playgta5.com folder (with “b” and “data”) inside it.');
 	if (n === 'data' || n === 'b' || /^[0-9a-f]{10}$/.test(n) || n === 'title' || n === 'shaders') return new FolderError('That is the “' + name + '” folder inside the game folder. Pick the folder above it: “playgta5.com”, or the “mirror” folder that contains it.');
-	return new FolderError('No game files found in “' + name + '”. Pick the folder named “mirror” (it contains “playgta5.com”, which holds the folders “b” and “data”).');
+	return new FolderError('No game files found in “' + name + '”. Pick the folder named “mirror” (it contains “playgta5.com”, which holds the folders “b” and “data”), or a .zip of it.');
+}
+// No game folder in what was picked, but zips: the biggest one that holds the game.
+async function readZips(zipFiles, top, progress) {
+	let firstError = null;
+	for (const zip of zipFiles.sort((a, b) => b.size - a.size).slice(0, 5)) {
+		try { const src = await readZip(zip, progress); src.where = top + '/' + src.where; return src; }
+		catch (e) { firstError = firstError || e; }
+	}
+	throw zipFiles.length === 1 && firstError ? firstError : notFound(top);
 }
 async function readHandle(top, progress) {
 	progress('Looking for the game files in “' + top.name + '”…');
 	// breadth first, at most a few levels down and a few hundred folders: a big folder picked by mistake is not walked to the end
-	const queue = [{ dir: top, path: '' }];
+	const queue = [{ dir: top, path: '' }], zips = [];
 	let root = null;
 	for (let visited = 0; queue.length && visited < 300 && !root; visited++) {
 		const { dir, path } = queue.shift();
-		const kids = await subdirs(dir);
+		const kids = await children(dir);
+		if (path.split('/').length < 4) zips.push(...kids.zips);
 		let build = null;
-		if (kids.has('b')) {
-			const bs = await subdirs(kids.get('b'));
+		if (kids.dirs.has('b')) {
+			const bs = (await children(kids.dirs.get('b'))).dirs;
 			for (const name of builds(bs.keys())) { const wasm = await lookup(bs.get(name), 'game.wasm'); if (wasm) { build = { name, dir: bs.get(name), wasm }; break; } }
 		}
-		const manifest = kids.has('data') ? await lookup(kids.get('data'), 'manifest.json') : null;
-		if (build || manifest) root = { path, dataDir: kids.get('data') || null, build };
-		else if (path.split('/').length < 5) for (const [name, h] of kids) queue.push({ dir: h, path: path + name + '/' });
+		const manifest = kids.dirs.has('data') ? await lookup(kids.dirs.get('data'), 'manifest.json') : null;
+		if (build || manifest) root = { path, dataDir: kids.dirs.get('data') || null, build };
+		else if (path.split('/').length < 5) for (const [name, h] of kids.dirs) queue.push({ dir: h, path: path + name + '/' });
 	}
-	if (!root) throw notFound(top.name);
+	if (!root) {
+		if (!zips.length) throw notFound(top.name);
+		return readZips(await Promise.all(zips.map((h) => h.getFile())), top.name, progress);
+	}
 	const data = new Map(), title = new Map();
 	if (root.dataDir) await walk(root.dataDir, '', data, (n) => progress('Listing the game data: ' + fmtN(n) + ' files'));
 	const bd = root.build && root.build.dir;
@@ -794,20 +813,14 @@ async function readHandle(top, progress) {
 		buildFile: async (p) => (bd ? fileOf(await lookup(bd, p)) : null),
 	};
 }
-function readFileList(list) {
-	const all = new Map();
-	let top = '';
-	for (const f of list) {
-		const rel = f.webkitRelativePath || f.name, i = rel.indexOf('/');
-		if (!top && i > 0) top = rel.slice(0, i);
-		all.set(i > 0 ? rel.slice(i + 1) : rel, f);
-	}
+// A flat list of paths (a folder's file list, or a zip's directory): the shallowest folder with data/manifest.json or b/<build>/game.wasm is the game's root.
+function readPaths(top, all) {
 	let root = null;
-	for (const p of all.keys()) {		// the shallowest folder with data/manifest.json or b/<build>/game.wasm
+	for (const p of all.keys()) {
 		const m = /^(|.*\/)data\/manifest\.json$/.exec(p) || /^(|.*\/)b\/[^/]+\/game\.wasm$/.exec(p);
 		if (m && (root === null || m[1].split('/').length < root.split('/').length)) root = m[1];
 	}
-	if (root === null) throw notFound(top || 'this folder');
+	if (root === null) return null;
 	const names = new Set();
 	for (const p of all.keys()) { const m = /^b\/([^/]+)\/game\.wasm$/.exec(p.slice(root.length)); if (p.startsWith(root) && m) names.add(m[1]); }
 	const build = builds(names)[0] || null;
@@ -819,11 +832,126 @@ function readFileList(list) {
 			const r = p.slice(bp.length);
 			inBuild.set(r, f);
 			if (r.startsWith('title/')) title.set(r.slice(6), f);
-			else if (r.startsWith('shaders/') && !r.slice(8).includes('/')) shaderFiles.set(r.slice(8), f);
+			else if (f instanceof File && r.startsWith('shaders/') && !r.slice(8).includes('/')) shaderFiles.set(r.slice(8), f);		// the GPU worker's fallback for single shaders (folders only)
 		}
 	}
 	const partials = [...data.keys()].filter((p) => p.endsWith('.part')).length;
-	return { where: (top + '/' + root).replace(/\/$/, ''), build, data, title, partials, shaderDir: null, shaderFiles, buildFile: async (p) => inBuild.get(p) || null };
+	return { where: (top + '/' + root).replace(/\/$/, ''), build, data, title, partials, shaderDir: null, shaderFiles, buildFile: async (p) => fileOf(inBuild.get(p) || null) };
+}
+async function readFileList(list, progress) {
+	const all = new Map();
+	let top = '';
+	for (const f of list) {
+		const rel = f.webkitRelativePath || f.name, i = rel.indexOf('/');
+		if (!top && i > 0) top = rel.slice(0, i);
+		all.set(i > 0 ? rel.slice(i + 1) : rel, f);
+	}
+	const src = readPaths(top || 'this folder', all);
+	if (src) return src;
+	const zips = [...all].filter(([p]) => isZip(p) && p.split('/').length <= 3).map(([, f]) => f);
+	if (!zips.length) throw notFound(top || 'this folder');
+	return readZips(zips, top || 'this folder', progress);
+}
+
+// ---- reading a zip of the mirror in place, without extracting it ----------------------------------------------------------------------------------------------
+// Such as the portable bundle (build_portable_zip.py: playgta5-offline/mirror/playgta5.com/..., ZIP64, files stored uncompressed). Only the zip's directory is read
+// up front (its last few MB). A stored file is then a slice of the zip (Blob.slice: no copy; read in place like a file on the disk). A compressed (deflated) file
+// cannot be read from the middle: one of at most INFLATE_MAX is unpacked whole when it is first used (in memory: the io worker for the game data, this page for
+// the engine, shaders and title art); bigger ones (57 of the game's data files are over 64 MB) need the zip extracted, or made without compression.
+const INFLATE_MAX = 64 * 1048576, BUILD_INFLATE_MAX = 256 * 1048576;
+const CP437 = 'ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ';		// names without the UTF-8 flag
+const u64 = (dv, o) => dv.getUint32(o, true) + dv.getUint32(o + 4, true) * 4294967296;
+class ZipEntry {
+	constructor(zip, e) { Object.assign(this, e); this.zip = zip; this.startP = null; }
+	get readable() { return !this.encrypted && (this.method === 0 || this.method === 8); }		// stored or deflated, no password
+	start() {		// where its bytes begin: after its local header, whose name and extra fields need not be as long as in the directory
+		return this.startP || (this.startP = this.zip.slice(this.offset, this.offset + 30).arrayBuffer().then((b) => {
+			const dv = new DataView(b);
+			if (b.byteLength < 30 || dv.getUint32(0, true) !== 0x04034b50) throw new FolderError('The zip is damaged: ' + this.name + ' is not where its directory says.');
+			return this.offset + 30 + dv.getUint16(26, true) + dv.getUint16(28, true);
+		}));
+	}
+	// What the io worker reads: a slice of the zip (stored), { deflated: the compressed bytes, size } (unpacked there when first used), or null (cannot be read in place).
+	async lazy() {
+		if (!this.readable || (this.method === 8 && this.size > INFLATE_MAX)) return null;
+		const s = await this.start();
+		if (this.method === 0 || !this.size) return this.zip.slice(s, s + this.size);
+		return { deflated: this.zip.slice(s, s + this.compSize), size: this.size };
+	}
+	async blob() {		// the whole file, unpacked if need be (this page, loader.js and the GPU worker use it as a File)
+		if (!this.readable) throw new FolderError(this.name + ' in the zip is ' + (this.encrypted ? 'password-protected' : 'packed with a method this page cannot read') + '.');
+		const s = await this.start();
+		if (this.method === 0 || !this.size) return this.zip.slice(s, s + this.size);
+		if (this.size > BUILD_INFLATE_MAX) throw new FolderError(this.name + ' is compressed in the zip and too big to unpack here.');
+		let out;
+		try { out = await new Response(this.zip.slice(s, s + this.compSize).stream().pipeThrough(new DecompressionStream('deflate-raw'))).blob(); }
+		catch (e) { throw new FolderError('The zip is damaged: ' + this.name + ' cannot be unpacked.'); }
+		if (out.size !== this.size) throw new FolderError('The zip is damaged: ' + this.name + ' unpacks to ' + fmtN(out.size) + ' bytes instead of ' + fmtN(this.size) + '.');
+		return out;
+	}
+}
+// The zip's central directory -> [{ name, method, compSize, size, offset (of the local header), encrypted }]. ZIP64 (over 4 GB or 65,535 files) and data in front
+// of the zip (offsets are then counted from where the zip starts) are handled like Python's zipfile does.
+async function readZipDirectory(zip) {
+	const damaged = (what) => new FolderError('“' + zip.name + '” is damaged or incomplete (' + what + '). Did the download or copy finish?');
+	const tailLen = Math.min(zip.size, 22 + 65535 + 20 + 56), tailAt = zip.size - tailLen;
+	const tail = new DataView(await zip.slice(tailAt).arrayBuffer());
+	let eocd = -1;
+	for (let i = tailLen - 22; i >= 0; i--) {		// the end record: the last signature, or the one whose comment ends the file (a signature inside a comment)
+		if (tail.getUint32(i, true) !== 0x06054b50) continue;
+		if (eocd < 0) eocd = i;
+		if (i + 22 + tail.getUint16(i + 20, true) === tailLen) { eocd = i; break; }
+	}
+	if (eocd < 0) throw new FolderError('“' + zip.name + '” is not a zip file, or it is incomplete. Did the download or copy finish?');
+	let cdSize = tail.getUint32(eocd + 12, true), cdOffset = tail.getUint32(eocd + 16, true), cdEnd = tailAt + eocd;
+	const saturated = tail.getUint16(eocd + 10, true) === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff, loc = eocd - 20;
+	if (loc >= 0 && tail.getUint32(loc, true) === 0x07064b50) {
+		// ZIP64 (whenever its locator is there, as Python's zipfile reads it): the real values are in the ZIP64 end record, right before the locator
+		let rec = loc >= 56 && tail.getUint32(loc - 56, true) === 0x06064b50 ? new DataView(tail.buffer, loc - 56, 56) : null;
+		cdEnd = tailAt + loc - 56;
+		if (!rec) {		// a ZIP64 end record with extra data: where the locator says
+			const at = u64(tail, loc + 8);
+			rec = new DataView(await zip.slice(at, at + 56).arrayBuffer());
+			if (rec.byteLength < 56 || rec.getUint32(0, true) !== 0x06064b50) throw damaged('no ZIP64 end record');
+			cdEnd = at;
+		}
+		cdSize = u64(rec, 40); cdOffset = u64(rec, 48);
+	} else if (saturated) throw damaged('no ZIP64 locator');
+	const cdStart = cdEnd - cdSize, shift = cdStart - cdOffset;
+	if (cdStart < 0 || shift < 0) throw damaged('its file list is out of place');
+	const cd = new DataView(await zip.slice(cdStart, cdEnd).arrayBuffer()), utf8 = new TextDecoder();
+	const entries = [];
+	for (let p = 0; p + 4 <= cd.byteLength && cd.getUint32(p, true) === 0x02014b50;) {
+		if (p + 46 > cd.byteLength) throw damaged('its file list is cut short');
+		const flags = cd.getUint16(p + 8, true), method = cd.getUint16(p + 10, true);
+		let compSize = cd.getUint32(p + 20, true), size = cd.getUint32(p + 24, true), offset = cd.getUint32(p + 42, true);
+		const nameLen = cd.getUint16(p + 28, true), extraLen = cd.getUint16(p + 30, true), commentLen = cd.getUint16(p + 32, true);
+		if (p + 46 + nameLen + extraLen > cd.byteLength) throw damaged('its file list is cut short');
+		for (let q = p + 46 + nameLen, qe = q + extraLen; q + 4 <= qe;) {
+			const id = cd.getUint16(q, true), len = cd.getUint16(q + 2, true), fe = Math.min(qe, q + 4 + len);
+			if (id === 1) {		// ZIP64 extended information: the 64-bit value of each field set to 0xFFFFFFFF, in this order
+				let r = q + 4;
+				if (size === 0xffffffff && r + 8 <= fe) { size = u64(cd, r); r += 8; }
+				if (compSize === 0xffffffff && r + 8 <= fe) { compSize = u64(cd, r); r += 8; }
+				if (offset === 0xffffffff && r + 8 <= fe) { offset = u64(cd, r); r += 8; }
+			}
+			q += 4 + len;
+		}
+		const nb = new Uint8Array(cd.buffer, p + 46, nameLen);
+		const name = (flags & 0x800 ? utf8.decode(nb) : Array.from(nb, (c) => (c < 128 ? String.fromCharCode(c) : CP437[c - 128])).join('')).replace(/\\/g, '/');
+		entries.push({ name, method, compSize, size, offset: offset + shift, encrypted: !!(flags & 1) });
+		p += 46 + nameLen + extraLen + commentLen;
+	}
+	if (!entries.length) throw damaged('no files listed');
+	return entries;
+}
+async function readZip(zip, progress) {
+	progress('Reading the zip “' + zip.name + '”…');
+	const all = new Map();
+	for (const e of await readZipDirectory(zip)) if (!e.name.endsWith('/')) all.set(e.name.replace(/^\/+/, ''), new ZipEntry(zip, e));
+	const src = readPaths(zip.name, all);
+	if (!src) throw notFound(zip.name, true);
+	return src;
 }
 
 // ---- checking the folder against the manifest, and what the engine is given ---------------------------------------------------------------------------------------
@@ -842,22 +970,24 @@ async function prepareFolder(src, progress) {
 	// every manifest entry: its File (case-insensitive fallback: a copy made on another file system), 32 handles at a time
 	const lower = new Map();
 	for (const k of src.data.keys()) lower.set(k.toLowerCase(), k);
-	const entries = manifest.files, found = new Array(entries.length).fill(null);
+	const entries = manifest.files, found = new Array(entries.length).fill(null), stuck = [];		// stuck: in the zip, but not readable in place (ZipEntry.lazy)
 	let next = 0, checked = 0;
 	const lane = async () => {
 		while (next < entries.length) {
 			const i = next++, p = entries[i][0];
 			const x = src.data.get(p) || src.data.get(lower.get(p.toLowerCase()));
-			if (x) { try { found[i] = await fileOf(x); } catch (e) { found[i] = null; } }
+			if (x) { try { found[i] = await dataFileOf(x); } catch (e) { if (e instanceof FolderError) throw e; found[i] = null; } }
+			if (x instanceof ZipEntry && !found[i]) stuck[i] = x;
 			if (++checked % 250 === 0) progress('Checking the game data: ' + fmtN(checked) + ' of ' + fmtN(entries.length) + ' files');
 		}
 	};
 	await Promise.all(Array.from({ length: 32 }, lane));
-	const eff = { ...manifest, files: [] }, files = [], missing = [], short = [];
+	const eff = { ...manifest, files: [] }, files = [], missing = [], short = [], compressed = [], unreadable = [];
 	let bytes = 0, expected = 0;
 	entries.forEach((e, i) => {
 		expected += e[1];
 		const f = found[i];
+		if (stuck[i]) { (stuck[i].readable ? compressed : unreadable).push(stuck[i]); return; }
 		if (!f) { missing.push(e[0]); return; }
 		if (f.size < e[1]) short.push(e[0]);		// smaller than the manifest says: most likely an unfinished copy or download
 		eff.files.push([e[0], f.size, ...e.slice(2)]);
@@ -869,10 +999,28 @@ async function prepareFolder(src, progress) {
 		const why = 'Missing: ' + missing.slice(0, 4).join(', ') + (missing.length > 4 ? ' and ' + fmtN(missing.length - 4) + ' more' : '') + '.' + (src.partials ? ' The folder has ' + count(src.partials, 'unfinished “.part” download', 'unfinished “.part” downloads') + '.' : '') + ' The game can stop or misbehave when it needs one of them.';
 		rows.push(['warn', 'Game data: ' + fmtN(files.length) + ' of ' + fmtN(entries.length) + ' files (' + fmtBytes(bytes) + ' of ' + fmtBytes(expected) + ')', why]);
 		problems.push(count(missing.length, 'game data file is', 'game data files are') + ' missing');
-	} else rows.push(['ok', 'Game data: ' + fmtN(files.length) + ' files, ' + fmtBytes(bytes)]);
+	} else if (compressed.length || unreadable.length) rows.push(['warn', 'Game data: ' + fmtN(files.length) + ' of ' + fmtN(entries.length) + ' files readable (' + fmtBytes(bytes) + ' of ' + fmtBytes(expected) + ')']);
+	else rows.push(['ok', 'Game data: ' + fmtN(files.length) + ' files, ' + fmtBytes(bytes)]);
 	if (short.length) {
 		rows.push(['warn', count(short.length, 'game data file is', 'game data files are') + ' smaller than expected', 'For example ' + short.slice(0, 3).join(', ') + '. They look incomplete: copy them again.']);
 		problems.push(count(short.length, 'file looks', 'files look') + ' incomplete');
+	}
+	if (compressed.length || unreadable.length) {
+		// Big files compressed inside the zip: the game reads small pieces from the middle of them, which a compressed file cannot give
+		const chromeOS = /\bCrOS\b/.test(navigator.userAgent);
+		const fix = chromeOS ? 'On a Chromebook: open the zip in the Files app (it opens like a folder), then choose the “mirror” folder inside it with “Choose your mirror folder”. Or extract the zip, or make it without compression.'
+			: 'Extract the zip (right-click it, Extract All) and choose the extracted folder, or make the zip without compression (7-Zip: compression level “Store”).';
+		if (compressed.length) {
+			rows.push(['warn', count(compressed.length, 'big game file is', 'big game files are') + ' compressed inside the zip (' + fmtBytes(compressed.reduce((a, e) => a + e.size, 0)) + ')', 'The game cannot read files over ' + (INFLATE_MAX / 1048576) + ' MB from a compressed zip. ' + fix]);
+			problems.push(count(compressed.length, 'big file is', 'big files are') + ' compressed in the zip');
+		}
+		if (unreadable.length) {
+			rows.push(['warn', count(unreadable.length, 'game file in the zip uses', 'game files in the zip use') + ' a password or a compression method this page cannot read', fix]);
+			problems.push(count(unreadable.length, 'file is', 'files are') + ' unreadable in the zip');
+		}
+	} else {
+		const zipped = files.filter((f) => f.deflated).length;		// small files compressed in a zip (ZipEntry.lazy)
+		if (zipped) notes.push(['info', count(zipped, 'game file is', 'game files are') + ' compressed in the zip: unpacked in memory when the game needs them']);
 	}
 	if (manifestFrom !== 'your folder') notes.push(['info', 'Data manifest taken from ' + manifestFrom]);
 	// the engine
@@ -925,7 +1073,7 @@ async function useFolder(read) {
 	if (busy || gameStarted) return;
 	busy = true;
 	prepared = null;
-	chooseBtn.disabled = resumeBtn.disabled = true;
+	setPicking(false);
 	anywayBtn.hidden = true;
 	statusEl.replaceChildren();
 	try {
@@ -943,7 +1091,7 @@ async function useFolder(read) {
 		if (!(e instanceof FolderError)) console.error(e);
 	} finally {
 		busy = false;
-		if (!gameStarted) { chooseBtn.disabled = resumeBtn.disabled = !crossOriginIsolated; chooseBtn.textContent = 'Choose another folder'; }
+		if (!gameStarted) { setPicking(crossOriginIsolated); chooseBtn.textContent = 'Choose another folder'; zipBtn.textContent = 'Choose another .zip'; }
 	}
 }
 function startGame(prep) {
@@ -972,8 +1120,18 @@ chooseBtn.onclick = async () => {
 	rememberFolder(dir);
 	useFolder((p) => readHandle(dir, p));
 };
-folderInput.onchange = () => { const list = folderInput.files; if (list && list.length) useFolder(async (p) => { p('Reading the folder list…'); return readFileList(list); }); };
-// Dragging the folder onto the page (Chrome, Edge: as a directory handle, remembered like a picked one).
+folderInput.onchange = () => { const list = folderInput.files; if (list && list.length) useFolder(async (p) => { p('Reading the folder list…'); return readFileList(list, p); }); };
+zipBtn.onclick = async () => {
+	if (busy) return;
+	if (!canPickFile) { zipInput.value = ''; zipInput.click(); return; }
+	let h;
+	try { [h] = await showOpenFilePicker({ id: 'gta5-game-zip', types: [{ description: 'Zip archive', accept: { 'application/zip': ['.zip'] } }] }); }
+	catch (e) { if (e.name !== 'AbortError') showRows(statusEl, [['bad', 'Could not open the file: ' + e.message]]); return; }
+	rememberFolder(h);
+	useFolder(async (p) => readZip(await h.getFile(), p));
+};
+zipInput.onchange = () => { const f = zipInput.files && zipInput.files[0]; if (f) useFolder((p) => readZip(f, p)); };
+// Dragging the folder or the zip onto the page (Chrome, Edge: as a handle, remembered like a picked one; elsewhere a dropped zip still works, not remembered).
 addEventListener('dragover', (e) => { e.preventDefault(); if (!gameStarted) setupEl.classList.add('dragging'); });
 addEventListener('dragleave', (e) => { if (!e.relatedTarget) setupEl.classList.remove('dragging'); });
 addEventListener('drop', (e) => {
@@ -982,12 +1140,13 @@ addEventListener('drop', (e) => {
 	if (gameStarted || busy || !crossOriginIsolated) return;
 	const item = [...e.dataTransfer.items].find((it) => it.kind === 'file');
 	if (!item) return;
-	if (typeof item.getAsFileSystemHandle !== 'function') { showRows(statusEl, [['warn', 'This browser cannot take a dropped folder: use the button instead.']]); return; }
-	item.getAsFileSystemHandle().then((h) => {
-		if (!h || h.kind !== 'directory') { showRows(statusEl, [['warn', 'Drop the folder itself (“mirror” or “playgta5.com”), not a file.']]); return; }
-		rememberFolder(h);
-		useFolder((p) => readHandle(h, p));
-	}, (err) => showRows(statusEl, [['bad', 'Could not open the dropped folder: ' + err.message]]));
+	const file = item.getAsFile(), handle = typeof item.getAsFileSystemHandle === 'function' ? item.getAsFileSystemHandle().catch(() => null) : Promise.resolve(null);		// both now: the drop's data goes away after the event
+	handle.then((h) => {
+		if (h && h.kind === 'directory') { rememberFolder(h); useFolder((p) => readHandle(h, p)); }
+		else if (h && h.kind === 'file' && isZip(h.name)) { rememberFolder(h); useFolder(async (p) => readZip(await h.getFile(), p)); }
+		else if (file && isZip(file.name)) useFolder((p) => readZip(file, p));
+		else showRows(statusEl, [['warn', h || (file && file.size) ? 'Drop the “mirror” folder, or a .zip of it.' : 'This browser cannot take a dropped folder: use the buttons instead.']]);
+	});
 });
 // A folder remembered from an earlier visit: one click (the browser may ask again for permission to read it).
 if (canPickDir) recallFolder().then((saved) => {
@@ -995,6 +1154,7 @@ if (canPickDir) recallFolder().then((saved) => {
 	resumeBtn.textContent = 'Continue with “' + saved.name + '”';
 	resumeBtn.hidden = false;
 	chooseBtn.textContent = 'Choose another folder';
+	zipBtn.textContent = 'Choose another .zip';
 	chooseBtn.classList.remove('primary');
 	resumeBtn.onclick = async () => {
 		if (busy) return;
@@ -1002,8 +1162,8 @@ if (canPickDir) recallFolder().then((saved) => {
 		try { state = await saved.queryPermission({ mode: 'read' }); if (state !== 'granted') state = await saved.requestPermission({ mode: 'read' }); } catch (e) { state = 'denied'; }
 		if (state !== 'granted') { showRows(statusEl, [['warn', 'Reading “' + saved.name + '” was not allowed. Allow it, or choose the folder again.']]); return; }
 		useFolder(async (p) => {
-			try { return await readHandle(saved, p); }
-			catch (e) { if (e && e.name === 'NotFoundError') { forgetFolder(); resumeBtn.hidden = true; chooseBtn.classList.add('primary'); throw new FolderError('“' + saved.name + '” is not there any more (moved or deleted?): choose the folder again.'); } throw e; }
+			try { return saved.kind === 'file' ? await readZip(await saved.getFile(), p) : await readHandle(saved, p); }
+			catch (e) { if (e && e.name === 'NotFoundError') { forgetFolder(); resumeBtn.hidden = true; chooseBtn.classList.add('primary'); throw new FolderError('“' + saved.name + '” is not there any more (moved or deleted?): choose it again.'); } throw e; }
 		});
 	};
 });

@@ -19,8 +19,9 @@
 //   hint ring (4 words per entry): file id, offset low, offset high, length (written last; 0 = free): a read the engine has queued and will perform later, one at a time (the
 //   streamer's single reader thread); fetching it now, HINT_PAR at a time, turns ~3 reads/s (one round trip each) into as many as the link carries. See drainHints.
 //
-// Local folder mode (the GitHub Pages build, index.html): the player picks their own copy of the game data, and the init message carries the File of every manifest
-// entry. Reads then go straight from those Files into the heap (see readLocal): no network, no store, no prefetch, no hints. Nothing is uploaded anywhere.
+// Local folder mode (the GitHub Pages build, index.html): the player picks their own copy of the game data (a folder, or a zip of it), and the init message carries
+// a File or Blob for every manifest entry (a zip's files are slices of the zip; compressed ones come as { deflated, size }). Reads then go straight from those into
+// the heap (see readLocal): no network, no store, no prefetch, no hints. Nothing is uploaded anywhere.
 'use strict';
 let mem, HEAP32, HEAPU8, table;
 let files = [], base = '', bc = null, pendingBytes = 0, lastPost = 0, noHints = false, dataQuery = '';		// noHints: ?nohints=1 (diagnostics), see drainHints; dataQuery: ?v=<manifest version> on every data URL
@@ -505,12 +506,48 @@ function localBlock(id, block) {
 	}
 	return p;
 }
+// A file stored compressed in the player's zip (index.html: { deflated: Blob of its compressed bytes, size }; at most 64 MB, bigger ones are refused there): a
+// deflate stream cannot be read from the middle, so it is unpacked whole on first use and kept while there is room (LRU, INFLATED_MAX in all). Files stored
+// uncompressed in a zip arrive as plain Blobs (slices of the zip) and are read like files on the disk.
+const INFLATED_MAX = 384 * 1048576;
+const inflatedCache = new Map(), inflating = new Map();		// id -> Uint8Array (LRU) / Promise of it
+let inflatedBytes = 0;
+function inflate(id) {
+	const hit = inflatedCache.get(id);
+	if (hit) { inflatedCache.delete(id); inflatedCache.set(id, hit); return hit; }
+	let p = inflating.get(id);
+	if (!p) {
+		p = (async () => {
+			const entry = localFiles[id];
+			let data;
+			try { data = entry.size ? new Uint8Array(await new Response(entry.deflated.stream().pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer()) : new Uint8Array(0); }
+			catch (e) { throw new Error('it cannot be unpacked: the zip looks damaged'); }		// a broken deflate stream (the browser only says "Failed to fetch")
+			if (data.length !== entry.size) throw new Error('it unpacked to ' + data.length + ' bytes instead of ' + entry.size + ': the zip looks damaged');
+			report(entry.deflated.size); tally(files[id], data.length);
+			inflatedCache.set(id, data); inflatedBytes += data.length;
+			for (const k of inflatedCache.keys()) {
+				if (inflatedBytes <= INFLATED_MAX) break;
+				if (k !== id) { inflatedBytes -= inflatedCache.get(k).length; inflatedCache.delete(k); }
+			}
+			return data;
+		})();
+		inflating.set(id, p);
+		p.then(() => inflating.delete(id), () => inflating.delete(id));
+	}
+	return p;
+}
 // Copies [off, off + len) of file id into the heap at dst; returns the bytes copied (fewer at the end of the file).
 async function readLocal(id, off, len, dst) {
 	const f = files[id], file = localFiles[id];
 	if (!file) throw new Error('the file is not in the folder');
 	const end = Math.min(off + len, file.size);
 	if (off >= end) return 0;
+	if (file.deflated) {
+		const cached = inflate(id), data = cached instanceof Uint8Array ? cached : await cached;
+		views();
+		HEAPU8.set(data.subarray(off, end), dst);
+		return end - off;
+	}
 	if (end - off >= LBS) {
 		const data = new Uint8Array(await file.slice(off, end).arrayBuffer());
 		report(data.length); tally(f, data.length);

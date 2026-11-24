@@ -24,7 +24,7 @@ And don't email me for asking the mirror folder. I will not reply to the email.
 # How to use
 
 ## Option A: play in the browser (GitHub Pages)
-The site only hosts the runtime scripts (`index.html`, `loader.js`, `game.js` and the workers). Every player brings their own `mirror` folder: the page reads the game files straight from their disk. Nothing is uploaded, and no game files are downloaded from the site.
+The site only hosts the runtime scripts (`index.html`, `loader.js`, `game.js` and the workers). Every player brings their own `mirror` folder, or a .zip of it: the page reads the game files straight from their disk. Nothing is uploaded, and no game files are downloaded from the site.
 
 **Turn on the site (once, in this repo):**
 1. Open the repo's **Settings → Pages**.
@@ -33,17 +33,21 @@ The site only hosts the runtime scripts (`index.html`, `loader.js`, `game.js` an
 
 **Play:**
 1. Open the site in a recent **Chrome** or **Edge** on a desktop computer. On the first visit the page reloads itself once. That reload turns on the shared memory the engine needs, which GitHub Pages can't enable by itself.
-2. Click **Choose your mirror folder** and pick your `mirror` folder (the one that contains `playgta5.com`), or the `playgta5.com` folder itself. You can also drag the folder onto the page.
-   - If the browser asks whether to "upload" the files or to let the site "view files", that's only how browsers word giving a page read access to a folder. Nothing is sent anywhere.
-3. The page checks your folder against the game's file list and starts the game. If something is missing or looks incomplete, it tells you what, and you can still try with **Start anyway**.
-4. On your next visit, Chrome and Edge remember the folder, so you only need to click **Continue with "mirror"**.
+2. Click **Choose your mirror folder** and pick your `mirror` folder (the one that contains `playgta5.com`), or the `playgta5.com` folder itself.
+   - **Have the zip instead?** Click **Choose a .zip instead** and pick it (for example `playgta5-offline-2026-10-06.zip`). There's no need to extract it: the page reads the game files straight out of the zip.
+   - You can also drag the folder or the zip onto the page.
+   - If the browser asks whether to "upload" the files or to let the site "view files", that's only how browsers word giving a page read access to a folder or file. Nothing is sent anywhere.
+3. The page checks your files against the game's file list and starts the game. If something is missing or looks incomplete, it tells you what, and you can still try with **Start anyway**.
+4. On your next visit, Chrome and Edge remember the folder or zip, so you only need to click **Continue with …**.
 
 You don't have to use GitHub Pages: any web server works too. For example, run `python -m http.server 8000 --bind 127.0.0.1` in this folder and open `http://localhost:8000/`.
 
 **If something goes wrong:**
 - *Cross-origin isolation* is marked ✕: reload the page. Don't use a private window, and open the site over `https://`, not as a file on your disk.
 - *WebGPU* is marked ✕: update your browser and graphics driver (`chrome://gpu` shows what's wrong).
-- The game stops with "could not read … from your game folder": the folder was moved or some files are missing. Reload and pick the folder again.
+- The game stops with "could not read … from your game folder": the folder or zip was moved, or some files are missing. Reload and pick it again.
+- "Big game files are compressed inside the zip": the game reads small pieces from the middle of its big files, which a compressed zip can't give it. Zips made with no compression (like `playgta5-offline-2026-10-06.zip`) work in place. For a compressed zip, either extract it and pick the extracted folder, or make the zip again without compression (7-Zip: compression level "Store").
+  - On a Chromebook, you can skip extracting: open the zip in the Files app (it opens like a folder), then use **Choose your mirror folder** and pick the `mirror` folder inside it.
 
 ## Option B: run it locally (Windows)
 1. Download the ZIP or just `git clone` it. It should have all this file and folders.
