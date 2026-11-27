@@ -456,9 +456,12 @@ function fpsDetail(d) {
 	const extra = [d.pipe >= 1 && 'compiling shaders ' + ms(d.pipe), d.up >= 1 && 'uploads ' + ms(d.up), (d.newShaders >= 0.5 || d.newPipelines >= 0.5) && 'new shaders ' + Math.round(d.newShaders || 0) + '/s, pipelines ' + Math.round(d.newPipelines || 0) + '/s (compiled by Chrome)'].filter(Boolean).join(' · ');
 	// what the per-draw savings did this frame: clears that became part of the next pass, constant uploads that matched the last ones, draws that could not touch a pixel
 	const saved = [d.merged >= 1 && Math.round(d.merged) + ' clears folded', d.reused >= 1 && Math.round(d.reused) + ' constants reused', d.noop >= 1 && Math.round(d.noop) + ' empty draws skipped'].filter(Boolean).join(' · ');
+	// the draw distance and occlusion (left out: far or tiny, hidden behind others; sizes known: the share of the world's draws whose box is known, the others are drawn).
 	// chunkActive false: no draw of the frames since the last report had the game's matrices where expected, so nothing could be left out (say so: the numbers would mislead)
-	const chunks = !(d.chunk && d.chunk.cell > 0) ? '' : d.chunkActive === false ? 'chunks: not working here (the game\'s object positions were not found), nothing left out'
-		: 'chunks: 3x3 of ' + d.chunk.cell + ' m' + (d.chunk.people ? ', people and cars ' + d.chunk.people + ' m' : '') + (d.chunkAuto > 0 ? ' (aiming at ' + Math.round(1000 / d.chunkAuto) + ' fps)' : '') + ' · ' + Math.round(d.culled || 0) + ' far draws left out';
+	const dist = d.chunk && (d.chunk.dist > 0 || d.chunk.tiny > 0);
+	const chunks = !dist && !d.occl ? '' : d.chunkActive === false ? 'draw distance: not working here (the game\'s object positions were not found), nothing left out'
+		: [dist && (d.chunk.dist > 0 ? 'draw distance ' + d.chunk.dist + ' m' + (d.chunkAuto > 0 ? ' (aiming at ' + Math.round(1000 / d.chunkAuto) + ' fps)' : '') + ' · ' : '') + Math.round(d.culled || 0) + ' far or tiny draws left out',
+			d.occl && (d.occlOn ? Math.round(d.hidden || 0) + ' hidden behind others' : 'hidden ones: no depth yet'), d.sizedPct >= 0 && 'sizes known ' + d.sizedPct + ' %'].filter(Boolean).join(' · ');
 	// what the draws are (the shader effect: ped, vehicle_*, trees*, normal*... = buildings and props, im = blits and UI, ...) and the reflection cube map's share
 	const top = (d.top || []).filter((x) => x[1] >= 1).map((x) => x[0] + ' ' + Math.round(x[1])).join(' · ');
 	const refl = (d.refl || 0) + (d.reflSkip || 0) >= 1 ? 'reflections ' + Math.round(d.refl || 0) + ' drawn' + (d.reflSkip >= 1 ? ', ' + Math.round(d.reflSkip) + ' skipped (each face every ' + d.reflEvery + ' frames)' : '') : '';
@@ -472,9 +475,12 @@ function fpsDetail(d) {
 {
 	const el = document.getElementById('fps');
 	let on = false;
-	new BroadcastChannel('game-fps').onmessage = (ev) => {
-		if (!on) return;
+	// the GPU worker times frames on the graphics chip (timestamp queries) only while the overlay is shown: told on each toggle, and again when a report says otherwise
+	const fpsCh = new BroadcastChannel('game-fps');
+	fpsCh.onmessage = (ev) => {
 		const d = ev.data;
+		if (d.overlay !== undefined && d.overlay !== on) fpsCh.postMessage({ overlay: on });
+		if (!on) return;
 		if (d.ms === undefined) { el.textContent = Math.round(d.fps) + ' FPS'; return; }
 		el.replaceChildren(Math.round(d.fps) + ' FPS', Object.assign(document.createElement('small'), { textContent: fpsDetail(d) }));
 	};
@@ -484,6 +490,7 @@ function fpsDetail(d) {
 		e.stopImmediatePropagation(); e.preventDefault();
 		if (e.repeat) return;
 		on = !on;
+		fpsCh.postMessage({ overlay: on });
 		el.style.display = on ? 'block' : 'none';
 		if (on) el.textContent = '-- FPS';
 	}, { capture: true });
@@ -519,13 +526,13 @@ const LOW_ARGS = () => ['-textureQuality=0', '-pedVariety=0', '-vehicleVariety=0
 // Fastest, Fast and Balanced differ only in resolution: the same lowest world, effects off (EFFECTS_OFF) and reflections redrawn every 30th frame (wgpu_worker.js REFLECT_EVERY).
 // On a 4-thread Chromebook (Intel N100) the frame time is set mostly by the number of draws (~1,100 at the lowest settings), not by pixels: resolution buys some frames, not all.
 const QUALITY = {
-	fastest: { label: 'Fastest', scale: 0.35, cap: [960, 540], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '120,0,0,150,100,0', fpsGoal: 50, aheadPlay: 0,
-		about: '35 % resolution (very blurry), the lowest world and effects; buildings and props drawn in 120 m chunks around you (growing when there is room), trees within 100 m. People and cars are always drawn. A fallback for the weakest graphics chips.' },
-	fast: { label: 'Fast', scale: 0.45, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '150,0,0,200,150,0', fpsGoal: 40, aheadPlay: 0,
-		about: '45 % resolution, the lowest world and effects; buildings and props drawn in 150 m chunks around you (between 120 and 300 m, following the frame rate), trees within 150 m.' },
-	balanced: { label: 'Balanced', scale: 0.58, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '150', fpsGoal: 30,
-		about: '58 % resolution. Buildings and props drawn only in the 3x3 chunks around you (the ground stays to the horizon), with the chunk size following the frame rate to keep about 30 frames per second. No shadows, ambient occlusion, depth of field, motion blur or anti-aliasing; reflections redrawn every 30th frame; fewest people and cars, lower texture detail. For Chromebooks and laptops.' },
-	full: { label: 'Full', scale: 1, cap: [3840, 2160], args: () => [], reflect: 1, effectsOff: false, chunk: '0',
+	fastest: { label: 'Fastest', scale: 0.35, cap: [960, 540], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '80,6', occl: true, fpsGoal: 50, aheadPlay: 0,
+		about: '35 % resolution (very blurry), the lowest world and effects; buildings and props drawn within 80 m of you (more when there is room), small things only up close, nothing that is hidden behind a building. People and cars are always drawn. A fallback for the weakest graphics chips.' },
+	fast: { label: 'Fast', scale: 0.45, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '120,4', occl: true, fpsGoal: 40, aheadPlay: 0,
+		about: '45 % resolution, the lowest world and effects; buildings and props drawn within 120 m of you (40 to 240 m, following the frame rate), small things only up close, nothing that is hidden behind a building.' },
+	balanced: { label: 'Balanced', scale: 0.58, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '200,3', occl: true, fpsGoal: 30,
+		about: '58 % resolution. Buildings and props drawn within 200 m of you (the ground stays to the horizon; large buildings and roads count from their nearest part), tiny far-away things and whatever is hidden behind buildings left out, the distance following the frame rate to keep about 30 frames per second. No shadows, ambient occlusion, depth of field, motion blur or anti-aliasing; reflections redrawn every 30th frame; fewest people and cars, lower texture detail. For Chromebooks and laptops.' },
+	full: { label: 'Full', scale: 1, cap: [3840, 2160], args: () => [], reflect: 1, effectsOff: false, chunk: '0', occl: false,
 		about: 'Native resolution and the game\'s own settings (effects the other presets turned off come back). For gaming PCs.' },
 };
 // The device's default: Balanced on a Chromebook or with 4 or fewer CPU threads (the low-memory profile, 4 GB or less, always runs Fast), Full otherwise
@@ -657,10 +664,12 @@ function startEngine(local) {
 		// the environment cube map (reflections on cars, glass and water) redrawn every n-th frame per face (wgpu_worker.js REFLECT_EVERY): ~180 draws a frame saved at most;
 		// ?reflect=n sets it (1: every frame)
 		reflect: Math.max(1, +(q.get('reflect') || 0) || preset.reflect || 1),
-		// chunks: only the world in the 3x3 cells around the camera is drawn (wgpu_worker.js CHUNK): cell size, then the distances of people and vehicles, decals, distant
-		// trees' stand-ins, trees, see-through glass and fences (0: like the rest of the world) in metres; ?chunk=0 turns it off, ?chunk=200,100,60,0,0,0 sets it
+		// the draw distance (wgpu_worker.js CHUNK): buildings and props whose nearest part is farther than this many metres are not drawn, nor ones smaller than the second
+		// number (thousandths) of their distance; ?chunk=0 turns it off, ?chunk=150,5 sets it
 		chunk: q.get('chunk') !== null ? q.get('chunk') : preset.chunk || '0',
-		// the chunk size follows the frame rate (wgpu_worker.js CHUNK_AUTO): the target frame time in ms; ?fpsgoal=0 keeps the sizes fixed, ?fpsgoal=45 aims at 45 fps
+		// occlusion (wgpu_worker.js OCCL): what an earlier frame's depth shows hidden behind other things is not drawn; ?occl=0 / ?occl=1 turns it off / on
+		occl: q.get('occl') !== null ? q.get('occl') === '1' : !!preset.occl,
+		// the draw distance follows the frame rate (wgpu_worker.js CHUNK_AUTO): the target frame time in ms; ?fpsgoal=0 keeps it fixed, ?fpsgoal=45 aims at 45 fps
 		chunkAuto: ((g) => (g > 0 ? 1000 / g : 0))(q.get('fpsgoal') !== null ? +q.get('fpsgoal') : preset.fpsGoal || 0),
 		// pipelines compiled ahead while you play (wgpu_worker.js AHEAD_PLAY): none on Fast and Fastest, where the CPU is needed for the frame; ?aheadplay=N sets it
 		aheadPlay: q.get('aheadplay') !== null ? +q.get('aheadplay') : preset.aheadPlay !== undefined ? preset.aheadPlay : 1,
