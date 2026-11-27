@@ -141,7 +141,8 @@ let noF32Filter = false, noD32S8 = false, noRG11 = false;
 let mem = null, memBuffer = null, i32 = null, u32 = null, f32 = null, u8 = null, ringBase = 0, ringSize = 0;
 let canvas = null, canvasCtx = null, canvasFormat = null, blit = null, canvasConfigured = false;
 let fpsChannel = null, fpsOverlayN = 0, fpsOverlayT = 0;
-const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0 };		// the frame-rate overlay's sums since its last report (present)
+const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0 };		// the frame-rate overlay's sums since its last report (present)
+const ovProgs = [];		// the programs drawn since the overlay's last report, each with its count in `ovN` (summed per effect for the report)
 // The GPU's share of a frame (the overlay's "GPU"): the time during which some submitted work is not finished yet, from the submit to the moment this worker learns that the
 // newest submit is done (its event loop gets a turn at least every 2 ms). It includes the GPU process's own work on the commands, so it is a little long, never short.
 let gpuSeq = 0, gpuDoneSeq = 0, gpuBusyT0 = 0;
@@ -762,7 +763,32 @@ function createTexture(id, dim, w, h, d, mips, arraySize, dxgi, bind, samples) {
 	const bytes = textureBytes(desc);
 	texBytesAlive += bytes; texCount++;
 	if (texBytesAlive > texBytesPeak) texBytesPeak = texBytesAlive;
-	objs.set(id, { kind: 'texture', tex, desc, format: m.format, views: new Map(), a8: !!m.a8, r11: !!m.r11, bytes });
+	// a square 6-layer render target is a cube map the game renders every frame (the environment reflections): see REFLECT_EVERY
+	const reflect = dim === 2 && arraySize === 6 && w === h && (bind & BIND_RT) ? new Int32Array(6).fill(-1000000) : null;
+	objs.set(id, { kind: 'texture', tex, desc, format: m.format, views: new Map(), a8: !!m.a8, r11: !!m.r11, bytes, reflect });
+}
+// ---- reflections at a lower rate ------------------------------------------------------------------------------------------------------------------------------
+// The game renders an environment cube map every frame for the reflections on cars, glass and water: each of its 6 faces from the scenery's low-detail models, a few dozen
+// draws per face (~180 a frame), each as costly here as any other draw. With REFLECT_EVERY = n (the page's Fast and Fastest presets: 4; ?reflect=n) a face is redrawn at
+// most every n-th frame: in between its clears and draws are skipped and it keeps its last picture, so reflections trail the view by a few frames. Decided per face, on the
+// first clear or draw of that face in a frame, so a game that renders one face per frame still gets every face redrawn.
+// The water's mirrored view (the scenery drawn with the shaders' *WaterReflection techniques into a target of its own) the same way: a target becomes a reflection when a
+// water-reflection draw goes into it, and stops being one for good when anything else but the sky and clouds is drawn into it (a target shared with another pass).
+const REFLECT_EVERY = isNode ? +(process.env.WGPU_REFLECT_EVERY || 1) : Math.max(1, Math.min(60, +(new URLSearchParams(self.location.search).get('reflect') || 1) | 0));
+// a water-reflection draw makes its target a reflection (redrawn every REFLECT_EVERY frames from now); anything but the sky or clouds in a water reflection undoes that for good
+function waterReflection(t, slice, ps) {
+	const kind = ps.reflKind || (ps.reflKind = /water_?reflection/i.test(ps.label) ? 'water' : /^(sky_system|clouds\w*)::/.test(ps.label) ? 'sky' : 'other');
+	if (t.water) { if (kind === 'other') { t.reflect = null; t.water = false; t.reflectNot = true; } }
+	else if (kind === 'water' && !t.reflect && t.desc.size.depthOrArrayLayers === 1) { t.reflect = new Int32Array(6).fill(-1000000); t.water = true; t.reflect[0] = presentCount; }
+	else if (kind === 'other' && !t.reflect) t.reflectNot = true;		// an ordinary target: never looked at again
+}
+function reflectDue(t, slice) {
+	if (REFLECT_EVERY <= 1 || slice > 5) return true;
+	const last = t.reflect[slice];
+	if (last === presentCount) return true;		// this face is being redrawn this frame
+	if (presentCount - last < REFLECT_EVERY) return false;
+	t.reflect[slice] = presentCount;
+	return true;
 }
 
 // Exit report: where the GPU-side memory of the mirror goes (diagnostics for the 4 GB target).
@@ -1978,6 +2004,12 @@ function doDraw(p) {
 		dbgFrameDraw++;
 	}
 	const kind = u32[p], count = u32[p + 1], inst = u32[p + 2], start = u32[p + 3], baseVertex = u32[p + 4] | 0, startInstance = u32[p + 5];
+	// a draw into a reflection (REFLECT_EVERY): skipped while that face keeps its picture from an earlier frame
+	const r0 = S.rt[0], t0 = r0.tex ? objs.get(r0.tex) : null;
+	if (t0 && t0.reflect) {
+		if (!reflectDue(t0, r0.slice)) { ov.reflSkip++; return; }
+		ov.refl++;
+	}
 	let vsObj = S.shader[0] ? objs.get(S.shader[0]) : null;
 	if (!vsObj) { skipDraw('if (!vsObj) { skippedDraws++; return; }'); return; }
 	let psObj = S.shader[1] ? objs.get(S.shader[1]) : null;
@@ -1993,6 +2025,7 @@ function doDraw(p) {
 		if (pv) { psObj = pv.obj; psProg = pv.prog; }
 		if (lastFitVs !== vsObj || lastFitPs !== psObj) { lastFitVs = vsObj; lastFitPs = psObj; pdirty = true; }
 	} else if (lastFitVs) { lastFitVs = lastFitPs = null; pdirty = true; }
+	if (REFLECT_EVERY > 1 && psProg && t0 && !t0.reflectNot && t0.reflect !== undefined) waterReflection(t0, r0.slice, psProg);
 	prepareDepthProxies(vsProg, 0);
 	if (psProg) prepareDepthProxies(psProg, 1);
 	if (!ensurePass()) { skipDraw('if (!ensurePass()) { skippedDraws++; return; }'); return; }
@@ -2093,6 +2126,7 @@ function doDraw(p) {
 		else pass.draw(dCount, dInst, vFirst, iFirst);
 	}
 	drawCount++;
+	{ const ep = psProg || vsProg; if (ep.ovN) ep.ovN++; else { ep.ovN = 1; ovProgs.push(ep); } }		// the overlay's draws per effect
 	if (nanHuntState === 2) { nanHuntLabel = vsProg.label + ' + ' + (psProg ? psProg.label : '-') + ' (draw ' + drawCount + ')'; nanHuntPs = psProg; nanHuntVs = vsProg; }
 	if (shotEvery || shotAllRt) {
 		const t0 = S.rt[0].tex ? objs.get(S.rt[0].tex) : null;
@@ -2685,6 +2719,7 @@ function clearView(t, mip, slice) {
 function clearRT(id, mip, slice, r, g, b, a) {
 	const t = objs.get(id);
 	if (!t || t.kind !== 'texture') return;
+	if (t.reflect && !reflectDue(t, slice)) return;		// a reflection face kept from an earlier frame (REFLECT_EVERY)
 	markColorDirty(t);
 	endPass();
 	const view = clearView(t, mip, slice);
@@ -3016,13 +3051,18 @@ async function present(id) {
 		// for the game's commands (idle), waiting for the GPU (wait: a frame slot or a fence), working (the rest: translating draws), and how long the GPU had work (gpu, see gpuTrack)
 		const tn = performance.now();
 		fpsOverlayN++;
-		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.gpu = 0; ov.draws = drawCount; }
+		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.gpu = ov.refl = ov.reflSkip = 0; ov.draws = drawCount; for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
 		else if (tn - fpsOverlayT >= 500) {
 			if (!fpsChannel) fpsChannel = new BroadcastChannel('game-fps');
 			if (gpuDoneSeq < gpuSeq) { ov.gpu += tn - gpuBusyT0; gpuBusyT0 = tn; }		// the GPU is still busy: its time so far counts now
 			const n = Math.max(1, fpsOverlayN), ms = (tn - fpsOverlayT) / n;
-			fpsChannel.postMessage({ fps: fpsOverlayN * 1000 / (tn - fpsOverlayT), ms, draws: (drawCount - ov.draws) / n, idle: ov.idle / n, wait: ov.wait / n, pipe: ov.pipe / n, up: ov.up / n, gpu: Math.min(ms, ov.gpu / n) });
-			fpsOverlayN = 0; fpsOverlayT = tn; ov.idle = ov.wait = ov.pipe = ov.up = ov.gpu = 0; ov.draws = drawCount;
+			const byEffect = new Map();
+			for (const pr of ovProgs) { const l = pr.label || '?', k = l.indexOf('::'), e = k > 0 ? l.slice(0, k) : l; byEffect.set(e, (byEffect.get(e) || 0) + pr.ovN); pr.ovN = 0; }
+			ovProgs.length = 0;
+			const top = [...byEffect].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([e, c]) => [e, c / n]);
+			fpsChannel.postMessage({ fps: fpsOverlayN * 1000 / (tn - fpsOverlayT), ms, draws: (drawCount - ov.draws) / n, idle: ov.idle / n, wait: ov.wait / n, pipe: ov.pipe / n, up: ov.up / n, gpu: Math.min(ms, ov.gpu / n),
+				top, refl: ov.refl / n, reflSkip: ov.reflSkip / n, reflEvery: REFLECT_EVERY });
+			fpsOverlayN = 0; fpsOverlayT = tn; ov.idle = ov.wait = ov.pipe = ov.up = ov.gpu = ov.refl = ov.reflSkip = 0; ov.draws = drawCount;
 		}
 	}
 	{	// loading progress for the page (phase3/index.html): first frame, then the world. The world starts with the first frame with a real scene (loading screens draw ~10
