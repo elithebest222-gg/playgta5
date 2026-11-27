@@ -476,6 +476,19 @@ async function readWithoutStore(id, off, len, dst) {
 // entries and names at boot: 3-4 reads per archive; the 33 KB radio stream blocks) go through a small cache of 64 KB blocks, so neighbouring small reads cost
 // one disk read instead of one each; big reads (streamed resources) go straight into the heap.
 let localFiles = null;		// file id -> File (null: not in the player's folder); null when the data comes over HTTP
+// The page's overlay ('=' key): the game's reads from the player's zip or folder each second, how long it waited for them (on average, the longest), and how much of a
+// compressed zip was unpacked (and how long that took): a slow disk, a zip on a network drive or a compressed zip show here. Posted on 'game-fps' every second.
+const ioStat = { n: 0, ms: 0, max: 0, bytes: 0, unpackN: 0, unpackMs: 0, unpackBytes: 0, t: 0 };
+let ioChannel = null;
+function postIoStat() {
+	const now = performance.now(), s = Math.max(0.001, (now - ioStat.t) / 1000);
+	if (ioStat.t) {
+		if (!ioChannel) ioChannel = new BroadcastChannel('game-fps');
+		ioChannel.postMessage({ io: { reads: ioStat.n / s, mb: ioStat.bytes / s / 1048576, avgMs: ioStat.n ? ioStat.ms / ioStat.n : 0, maxMs: ioStat.max, waitMs: ioStat.ms / s,
+			unpacks: ioStat.unpackN / s, unpackMs: ioStat.unpackMs / s, unpackMB: ioStat.unpackBytes / s / 1048576, compressed: inflatedCache.size + inflating.size > 0 } });
+	}
+	ioStat.t = now; ioStat.n = ioStat.ms = ioStat.max = ioStat.bytes = ioStat.unpackN = ioStat.unpackMs = ioStat.unpackBytes = 0;
+}
 const LBS = 65536, LCACHE_MAX = (self.navigator && self.navigator.deviceMemory && self.navigator.deviceMemory <= 8 ? 32 : 64) * 1048576;		// 32 MB on an 8 GB computer: the game's own memory comes first
 const lcache = new Map(), linflight = new Map();		// id * 1048576 + block -> Uint8Array (LRU) / Promise of it
 let lcacheBytes = 0, localErrors = 0;
@@ -529,12 +542,13 @@ function inflate(id) {
 	let p = inflating.get(id);
 	if (!p) {
 		p = (async () => {
-			const entry = localFiles[id];
+			const entry = localFiles[id], t0 = performance.now();
 			let data;
 			try { data = entry.size ? new Uint8Array(await new Response(entry.deflated.stream().pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer()) : new Uint8Array(0); }
 			catch (e) { throw new Error('it cannot be unpacked: the zip looks damaged'); }		// a broken deflate stream (the browser only says "Failed to fetch")
 			if (data.length !== entry.size) throw new Error('it unpacked to ' + data.length + ' bytes instead of ' + entry.size + ': the zip looks damaged');
 			report(entry.deflated.size); tally(files[id], data.length);
+			ioStat.unpackN++; ioStat.unpackMs += performance.now() - t0; ioStat.unpackBytes += data.length;
 			inflatedCache.set(id, data); inflatedBytes += data.length;
 			for (const k of inflatedCache.keys()) {
 				if (inflatedBytes <= INFLATED_MAX) break;
@@ -598,7 +612,12 @@ async function serve(slot) {
 		if (off >= f.size) result = 0;
 		else {
 			if (off + len > f.size) len = f.size - off;
-			if (localFiles) result = await readLocal(id, off, len, dst);		// the player's own folder (index.html)
+			if (localFiles) {		// the player's own zip or folder (index.html), timed for the page's overlay (ioStat)
+				const t0 = performance.now();
+				result = await readLocal(id, off, len, dst);
+				const ms = performance.now() - t0;
+				ioStat.n++; ioStat.ms += ms; if (ms > ioStat.max) ioStat.max = ms; ioStat.bytes += Math.max(0, result);
+			}
 			else if (sh) {
 				// read-ahead: a read that continues the previous one of this file (a sequential scan) also fetches the next bytes, doubling up to MAX_AHEAD; anything else fetches only what it needs
 				const st = seq.get(id) || { end: -1, ahead: 0 };
@@ -707,6 +726,7 @@ async function init(m) {
 		files = m.local.manifest.files.map((f) => ({ path: f[0], size: f[1] }));
 		files.forEach((f, i) => pathIndex.set(f.path, i));
 		localFiles = m.local.files;
+		setInterval(postIoStat, 1000);
 		if (localFiles.length !== files.length) bc.postMessage({ error: 'local folder: ' + localFiles.length + ' files for ' + files.length + ' manifest entries' });
 		traceOn = !!m.trace;
 		if (remoteLog) startNetStats();
