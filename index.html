@@ -453,7 +453,7 @@ function fpsDetail(d) {
 	const work = Math.max(0, d.ms - d.idle - d.wait), gpu = d.gpu || 0;
 	// "GPU busy" is the time from a submit until the work is done: Chrome's GPU process handling every draw (a CPU cost per draw) and the graphics chip's own work
 	const slowest = gpu >= 0.85 * d.ms ? 'the graphics side (Chrome\'s GPU process and the chip: fewer draws or pixels help)' : work >= 0.8 * d.ms ? 'translating draws (CPU)' : 'the game\'s threads (CPU)';
-	const extra = [d.pipe >= 1 && 'compiling shaders ' + ms(d.pipe), d.up >= 1 && 'uploads ' + ms(d.up)].filter(Boolean).join(' · ');
+	const extra = [d.pipe >= 1 && 'compiling shaders ' + ms(d.pipe), d.up >= 1 && 'uploads ' + ms(d.up), (d.newShaders >= 0.5 || d.newPipelines >= 0.5) && 'new shaders ' + Math.round(d.newShaders || 0) + '/s, pipelines ' + Math.round(d.newPipelines || 0) + '/s (compiled by Chrome)'].filter(Boolean).join(' · ');
 	// what the per-draw savings did this frame: clears that became part of the next pass, constant uploads that matched the last ones, draws that could not touch a pixel
 	const saved = [d.merged >= 1 && Math.round(d.merged) + ' clears folded', d.reused >= 1 && Math.round(d.reused) + ' constants reused', d.noop >= 1 && Math.round(d.noop) + ' empty draws skipped'].filter(Boolean).join(' · ');
 	// chunkActive false: no draw of the frames since the last report had the game's matrices where expected, so nothing could be left out (say so: the numbers would mislead)
@@ -462,8 +462,10 @@ function fpsDetail(d) {
 	// what the draws are (the shader effect: ped, vehicle_*, trees*, normal*... = buildings and props, im = blits and UI, ...) and the reflection cube map's share
 	const top = (d.top || []).filter((x) => x[1] >= 1).map((x) => x[0] + ' ' + Math.round(x[1])).join(' · ');
 	const refl = (d.refl || 0) + (d.reflSkip || 0) >= 1 ? 'reflections ' + Math.round(d.refl || 0) + ' drawn' + (d.reflSkip >= 1 ? ', ' + Math.round(d.reflSkip) + ' skipped (each face every ' + d.reflEvery + ' frames)' : '') : '';
+	// the graphics chip's own time for a sampled frame (timestamp queries), with the passes that took most
+	const chip = d.chip && d.chip.ms > 0 ? 'graphics chip: ' + ms(d.chip.ms) + ' of work a frame · ' + d.chip.top.filter((x) => x[1] >= 0.5).map((x) => x[0] + ' ' + ms(x[1])).join(' · ') : '';
 	return ms(d.ms) + ' a frame · ' + Math.round(d.draws) + ' draws\nGPU busy ' + ms(gpu) + ' · translating ' + ms(work) + ' · waiting for the game ' + ms(d.idle) + (d.wait >= 0.5 ? ' · waiting for the GPU ' + ms(d.wait) : '') + (extra ? '\n' + extra : '') +
-		(top ? '\nmost drawn: ' + top : '') + (refl ? '\n' + refl : '') + (saved ? '\nsaved: ' + saved : '') + (chunks ? '\n' + chunks : '') + '\nslowest: ' + slowest;
+		(top ? '\nmost drawn: ' + top : '') + (refl ? '\n' + refl : '') + (saved ? '\nsaved: ' + saved : '') + (chunks ? '\n' + chunks : '') + (chip ? '\n' + chip : '') + '\nslowest: ' + slowest;
 }
 // FPS counter, top left: off by default, the = key toggles it. The GPU worker counts presented frames and posts the rate twice a second on 'game-fps'. The key does not reach
 // the game (capture phase on window, before the input handlers; this build has debug key bindings).
@@ -517,9 +519,9 @@ const LOW_ARGS = () => ['-textureQuality=0', '-pedVariety=0', '-vehicleVariety=0
 // Fastest, Fast and Balanced differ only in resolution: the same lowest world, effects off (EFFECTS_OFF) and reflections redrawn every 30th frame (wgpu_worker.js REFLECT_EVERY).
 // On a 4-thread Chromebook (Intel N100) the frame time is set mostly by the number of draws (~1,100 at the lowest settings), not by pixels: resolution buys some frames, not all.
 const QUALITY = {
-	fastest: { label: 'Fastest', scale: 0.35, cap: [960, 540], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '80,50,25,50', fpsGoal: 50, aheadPlay: 0,
+	fastest: { label: 'Fastest', scale: 0.35, cap: [960, 540], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '64,40,20,40,35,25', fpsGoal: 50, aheadPlay: 0,
 		about: '35 % resolution (very blurry), the lowest world and effects; the draw distance shrinks or grows to keep about 50 frames per second. A fallback for the weakest graphics chips.' },
-	fast: { label: 'Fast', scale: 0.45, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '120,75,40,100', fpsGoal: 40, aheadPlay: 0,
+	fast: { label: 'Fast', scale: 0.45, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '100,60,30,80,60,40', fpsGoal: 40, aheadPlay: 0,
 		about: '45 % resolution, the lowest world and effects; the draw distance shrinks or grows to keep about 40 frames per second.' },
 	balanced: { label: 'Balanced', scale: 0.58, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '150,90,50', fpsGoal: 30,
 		about: '58 % resolution. Buildings and props drawn only in the 3x3 chunks around you (the ground stays to the horizon), with the chunk size following the frame rate to keep about 30 frames per second. No shadows, ambient occlusion, depth of field, motion blur or anti-aliasing; reflections redrawn every 30th frame; fewest people and cars, lower texture detail. For Chromebooks and laptops.' },
@@ -655,8 +657,8 @@ function startEngine(local) {
 		// the environment cube map (reflections on cars, glass and water) redrawn every n-th frame per face (wgpu_worker.js REFLECT_EVERY): ~180 draws a frame saved at most;
 		// ?reflect=n sets it (1: every frame)
 		reflect: Math.max(1, +(q.get('reflect') || 0) || preset.reflect || 1),
-		// chunks: only the world in the 3x3 cells around the camera is drawn (wgpu_worker.js CHUNK): cell size, people and vehicles' distance, decals' distance, distant trees'
-		// stand-ins' distance (0: like the rest of the world) in metres; ?chunk=0 turns it off, ?chunk=200,100,60,0 sets it
+		// chunks: only the world in the 3x3 cells around the camera is drawn (wgpu_worker.js CHUNK): cell size, then the distances of people and vehicles, decals, distant
+		// trees' stand-ins, trees, see-through glass and fences (0: like the rest of the world) in metres; ?chunk=0 turns it off, ?chunk=200,100,60,0,0,0 sets it
 		chunk: q.get('chunk') !== null ? q.get('chunk') : preset.chunk || '0',
 		// the chunk size follows the frame rate (wgpu_worker.js CHUNK_AUTO): the target frame time in ms; ?fpsgoal=0 keeps the sizes fixed, ?fpsgoal=45 aims at 45 fps
 		chunkAuto: ((g) => (g > 0 ? 1000 / g : 0))(q.get('fpsgoal') !== null ? +q.get('fpsgoal') : preset.fpsGoal || 0),
