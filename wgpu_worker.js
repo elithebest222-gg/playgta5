@@ -140,8 +140,8 @@ let gpu = null, adapter = null, device = null;
 let noF32Filter = false, noD32S8 = false, noRG11 = false;
 let mem = null, memBuffer = null, i32 = null, u32 = null, f32 = null, u8 = null, ringBase = 0, ringSize = 0;
 let canvas = null, canvasCtx = null, canvasFormat = null, blit = null, canvasConfigured = false;
-let fpsChannel = null, fpsOverlayN = 0, fpsOverlayT = 0;
-const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0, merged: 0, reused: 0, noop: 0, culled: 0, chunkFrames: 0, mods: 0, pipes: 0 };		// merged/reused/noop: the counters' values at the last report		// the frame-rate overlay's sums since its last report (present)
+let fpsChannel = null, fpsOverlayN = 0, fpsOverlayT = 0, overlayOn = false;		// overlayOn: the page shows the overlay ('=' key): only then are frames timed on the chip (gpuTiming)
+const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0, merged: 0, reused: 0, noop: 0, culled: 0, chunkFrames: 0, mods: 0, pipes: 0, sized: 0, sizedK: 0, hidden: 0 };		// merged/reused/noop: the counters' values at the last report		// the frame-rate overlay's sums since its last report (present)
 const ovProgs = [];		// the programs drawn since the overlay's last report, each with its count in `ovN` (summed per effect for the report)
 // The GPU's share of a frame (the overlay's "GPU"): the time during which some submitted work is not finished yet, from the submit to the moment this worker learns that the
 // newest submit is done (its event loop gets a turn at least every 2 ms). It includes the GPU process's own work on the commands, so it is a little long, never short.
@@ -258,8 +258,11 @@ function flush(reason) {
 	endPass();
 	if (dirtyChunks.size) flushUniforms();
 	const resolves = pendingResolve.length ? recordResolves() : null;		// into this encoder: no command buffer of its own
+	const boxes = boxRequests.length ? boxEncode(getEncoder()) : null;		// vertex buffers whose boxes are read back (draw distance)
 	if (encoder) { device.queue.submit([encoder.finish()]); encoder = null; onSubmitted(); submits++; counterSlot = 0; if (!isNode) gpuTrack(); }
 	if (resolves) mapResolves(resolves);
+	if (boxes) boxRead(boxes);
+	if (occl.busy && !occl.busy.mapping) occlMap();		// the depth grid's copy went with this submit
 	fr.flush += performance.now() - tf0;
 	usedInEncoder.clear();
 }
@@ -835,39 +838,31 @@ function createTexture(id, dim, w, h, d, mips, arraySize, dxgi, bind, samples) {
 // The water's mirrored view (the scenery drawn with the shaders' *WaterReflection techniques into a target of its own) the same way: a target becomes a reflection when a
 // water-reflection draw goes into it, and stops being one for good when anything else but the sky and clouds is drawn into it (a target shared with another pass).
 const REFLECT_EVERY = isNode ? +(process.env.WGPU_REFLECT_EVERY || 1) : Math.max(1, Math.min(60, +(new URLSearchParams(self.location.search).get('reflect') || 1) | 0));
-// ---- chunks: only the world near the camera is drawn ------------------------------------------------------------------------------------------------------
+// ---- draw distance by object size ---------------------------------------------------------------------------------------------------------------------------
 // The game streams and draws its world by its own rules (already at their lowest), and every draw costs about the same here and in Chrome's GPU process however far away or
-// small it is. With chunks on (the page's Balanced, Fast and Fastest; ?chunk=cell,people,details in metres, 0 = off) the map is a grid of square cells of `cell` metres and only
-// the 3x3 cells around the camera are drawn: a solid object of the world in any other cell is not drawn at all, and people and vehicles (each a dozen draws or more) farther than
-// `people` metres and decals (dirt, graffiti, tyre marks) farther than `details` are not either. The ground, water, sky, lights and effects are always drawn, so the land
-// stays to the horizon. Only draws of the G-buffer pass (3 or more colour targets) are looked at, and only when the vertex constants at register b1 hold the game's matrices
-// (rage_matrices: gWorld, gWorldView, gWorldViewProj, gViewInverse): the object's and the camera's transforms must both be rigid ones (last column or row 0, 0, 0, 1), the
-// object's must not be the identity (instanced and world-space geometry carry their positions elsewhere), and the camera must be the same as for the frame's other draws.
-// Anything else is drawn as before.
+// small it is. With a draw distance (the page's Balanced, Fast and Fastest; ?chunk=metres,tiny) a solid object of the world is left out when the nearest point of its box is
+// farther than `metres` from the camera (along the ground: flying high leaves the city below as it was), or, with `tiny` (thousandths), when it is so small for how far it is
+// that it would cover a few pixels: its size below tiny/1000 of its distance (not glass: a missing window is a hole). An object's box is the box of its vertex buffer's
+// positions, read back from the GPU once, the first time the buffer is drawn (vbBoxRequest), and placed by the object's matrix: a long road or a block of buildings is drawn
+// while any part of it is near. (Square cells judged by an object's origin left out roads that started two cells away: "roads don't load in".) Until its box is known an
+// object is drawn. The ground, water, sky, lights and effects are always drawn, so the land stays to the horizon; people, vehicles and anything skinned too (see chunkCull).
+// Only draws of the frame's main view are looked at (its G-buffer pass gives the camera), and only when the vertex constants at register b1 hold the game's matrices
+// (rage_matrices: gWorld, gWorldView, gWorldViewProj, gViewInverse): the object's and the camera's transforms must be rigid ones, scaled or not (last column or row
+// 0, 0, 0, 1), the object's must not be the identity (instanced and world-space geometry carry their positions elsewhere), and the camera must be the same as for the
+// frame's other draws. Anything else is drawn as before.
 const CHUNK = (() => {
 	const v = (isNode ? process.env.WGPU_CHUNK || '' : new URLSearchParams(self.location.search).get('chunk') || '').split(',').map((x) => Math.max(0, +x || 0));
-	return { cell: v[0] || 0, people: v[1] || 0, details: v[2] || 0, lodTrees: v[3] || 0, trees: v[4] || 0, glass: v[5] || 0 };
+	return { dist: v[0] || 0, tiny: Math.min(0.05, (v[1] || 0) / 1000) };
 })();
-// A draw is judged by its object's origin, and large objects reach far from theirs: road pieces and building blocks can be over 100 m long. With cells of a few dozen metres
-// (Fastest went down to 26 m) the road under the car was left out whenever its origin lay two cells away (reported: "roads don't load in"). Cells never get smaller than this,
-// so whatever is drawn starts at least 120 m from the camera; trees, which are small, may have a shorter distance of their own, not below CHUNK_MIN_TREES.
-const CHUNK_MIN_CELL = 120, CHUNK_MIN_TREES = 100, CHUNK_MIN_LOD_TREES = 150;
-// people/vehicles (kind 2), decals (3) and glass (6) have no distances of their own any more (kept in ?chunk for the order of the values): see chunkCull
-function chunkFloors() {
-	if (CHUNK.cell > 0) CHUNK.cell = Math.max(CHUNK_MIN_CELL, CHUNK.cell);
-	if (CHUNK.trees > 0) CHUNK.trees = Math.max(CHUNK_MIN_TREES, CHUNK.trees);
-	if (CHUNK.lodTrees > 0) CHUNK.lodTrees = Math.max(CHUNK_MIN_LOD_TREES, CHUNK.lodTrees);
-}
-chunkFloors();
-const chunkCam = { frame: -1, x: 0, y: 0, cx: 0, cy: 0 };
-let chunkCulled = 0;
-// Chunks that follow the frame rate (?chunkauto=<target frame time in ms>, the page's presets: 33 ms on Balanced): once a second the three distances are scaled together, down
-// (x0.85, to 0.4 of the preset's at least) while the frames take longer than the target, back up (x1.08, to twice the preset's at most) while there is room, or while the
-// game's own threads are what holds the frame rate: this worker waiting for their commands half the frame or more with the GPU side mostly free (fewer draws would not help).
+const CHUNK_MIN_DIST = 40, CHUNK_MAX_TINY = 0.02;		// while the distance follows the frame rate: never nearer than 40 m, never more than 2 % for `tiny`
+const chunkCam = { frame: -1, x: 0, y: 0, z: 0 };
+let chunkCulled = 0, chunkSized = 0, chunkUnsized = 0, chunkFrames = 0;
+// A draw distance that follows the frame rate (?chunkauto=<target frame time in ms>, the page's presets): once a second it is scaled, down (x0.85, to 0.4 of the preset's
+// at least) while the frames take longer than the target, back up (x1.08, to twice the preset's at most) while there is room, or while the game's own threads are what
+// holds the frame rate: this worker waiting for their commands half the frame or more with the GPU side mostly free (fewer draws would not help). `tiny` goes the other way.
 // (A rule that only shrank when one part was busy 70 % of the frame never fired on a 4-thread CPU, where the game's threads, this worker and the GPU process share the cores.)
 const CHUNK_AUTO = isNode ? 0 : Math.max(0, +(new URLSearchParams(self.location.search).get('chunkauto') || 0));
 const CHUNK_BASE = { ...CHUNK }, CHUNK_MIN_SCALE = 0.4, CHUNK_MAX_SCALE = 2;
-
 let chunkScale = 1;
 const chunkWin = { t: 0, n: 0, idle: 0, wait: 0, gpu: 0 };		// this second's frames (present)
 function chunkAdaptStep(scale, ms, gpu, idle, target) {
@@ -878,12 +873,11 @@ function chunkAdaptStep(scale, ms, gpu, idle, target) {
 }
 function chunkApplyScale(scale) {
 	chunkScale = scale;
-	for (const k in CHUNK_BASE) CHUNK[k] = Math.round(CHUNK_BASE[k] * scale);
-	chunkFloors();
+	if (CHUNK_BASE.dist > 0) CHUNK.dist = Math.max(CHUNK_MIN_DIST, Math.round(CHUNK_BASE.dist * scale));
+	if (CHUNK_BASE.tiny > 0) CHUNK.tiny = Math.min(CHUNK_MAX_TINY, CHUNK_BASE.tiny / scale);
 }
-// 0: never culled, 1: the world's solid objects (buildings, props), 2: people and vehicles, 3: decals, 4: the stand-ins of distant trees (trees_lod*: a recording on
-// an N100 Chromebook had ~100 of them a frame on a road through hills, more than any other kind), 5: trees (alpha-tested leaves: costly on small GPUs), 6: see-through
-// glass and fences of the world (blended or alpha-tested). Kinds 4-6 with a distance of 0 are culled like kind 1.
+// 0: never culled, 1: the world's solid objects (buildings, props), 2: people and vehicles, 3: decals, 4: the stand-ins of distant trees (trees_lod*), 5: trees,
+// 6: see-through glass and fences of the world (blended or alpha-tested)
 function chunkKind(label) {
 	const k = label.indexOf('::'), e = (k > 0 ? label.slice(0, k) : label).toLowerCase();
 	if (/^(terrain|water|sky|cloud|im$|imms|postfx|deferred|lighting|ptfx|ptxgpu|rmptfx|debug|scaleform|radar|rage_|shadow|ssao|hdao|blur|cascade|mirror|billboard|grass|light|spot|point|capsule|tiled|volume|fog|lens|rain|snow|corona|vfx|cubemap|reflect|seethrough|occlu|stencil|copy|clear|downsample|gpu|cs_|directional|distortion|memory|adaptive|avg|damage|distance|dof|exposure|golf|mlaa|silhouette|skinblend|waveform|rope|cable|blend_2lyr)/.test(e)) return 0;
@@ -895,18 +889,100 @@ function chunkKind(label) {
 	if (/decal/.test(e)) return 3;
 	return 1;
 }
-// the object's and the camera's map positions from 64 floats at f[b..] (gWorld at b, gViewInverse at b + 48), or null when they are not two rigid transforms (row-major as
-// the game stores them, the translation in the last row, or the transpose); out = [x, y, cx, cy, identity]
-const chunkPos = [0, 0, 0, 0, 0];
-function chunkMatrices(f, b) {
+// The box of a vertex buffer's positions: the element at offset 0 of slot 0 as three or four floats (the game's vertex formats start with the position), read back from the
+// GPU: copies into one of two 4 MB staging buffers recorded at the end of the next submit (BOX_PER_FLUSH buffers at most), mapped after it; with both staging buffers being
+// read, nothing more until one is back. A buffer whose data does not look like positions (not finite, beyond 100 km, all of unit length: normals, or all one point) gets no
+// box; one uploaded again is read again (streamed geometry), up to twice, then never (data that keeps changing: CPU-skinned, cloth). A box is only used for draws that bind
+// the buffer from offset 0 with the stride it was read with.
+// o.boxSt: undefined not looked at yet, 1 being read, 2 no box, 3 o.box = [min x, y, z, max x, y, z]
+const BOX_STAGE_BYTES = 4 << 20, BOX_PER_FLUSH = 48, BOX_STAGES = 2;
+const boxRequests = [], boxStages = [];
+let boxStagesMade = 0;
+function vbBoxRequest(o, layout, stride) {
+	o.boxSt = 2; o.boxSeen = true;
+	if (!layout || !stride || (stride & 3) || !o.gpu || o.bytes > BOX_STAGE_BYTES || (o.reup || 0) > 2) return;
+	let e = null;
+	for (const x of layout.els) if (x.slot === 0 && x.offset === 0 && x.cls === 0) { e = x; break; }
+	if (!e || (e.fmt !== 6 && e.fmt !== 2)) return;		// DXGI R32G32B32_FLOAT, R32G32B32A32_FLOAT
+	o.boxSt = 1; o.boxStride = stride; o.boxGen = o.gen || 0;
+	boxRequests.push(o);
+}
+function boxEncode(enc) {		// in flush(), right before the submit: no buffer can go away in between
+	if (!boxStages.length && boxStagesMade >= BOX_STAGES) return null;		// both staging buffers are being read
+	const list = [];
+	let at = 0;
+	while (boxRequests.length && list.length < BOX_PER_FLUSH * 4) {
+		const o = boxRequests[0], n = o.bytes;
+		if (objs.get(o.uid) !== o || !o.gpu || o.boxSt !== 1) { boxRequests.shift(); continue; }
+		if (at + n > BOX_STAGE_BYTES) break;
+		boxRequests.shift();
+		list.push(o, at, n, o.boxGen);
+		at += n;
+	}
+	if (!list.length) return null;
+	const stage = boxStages.pop() || (boxStagesMade++, device.createBuffer({ size: BOX_STAGE_BYTES, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }));
+	for (let i = 0; i < list.length; i += 4) enc.copyBufferToBuffer(list[i].gpu, 0, stage, list[i + 1], list[i + 2]);
+	return { stage, list, bytes: at };
+}
+function boxFromFloats(f, stride, count) {		// null when the floats are not positions (see above)
+	const step = stride >> 2;
+	let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity, unit = count > 8;
+	for (let i = 0, k = 0; i < count; i++, k += step) {
+		const x = f[k], y = f[k + 1], z = f[k + 2];
+		if (!(x > -1e5 && x < 1e5 && y > -1e5 && y < 1e5 && z > -1e5 && z < 1e5)) return null;
+		if (x < x0) x0 = x; if (x > x1) x1 = x;
+		if (y < y0) y0 = y; if (y > y1) y1 = y;
+		if (z < z0) z0 = z; if (z > z1) z1 = z;
+		if (unit) { const l2 = x * x + y * y + z * z; if (l2 < 0.96 || l2 > 1.04) unit = false; }
+	}
+	if (!count || unit || x1 - x0 + y1 - y0 + z1 - z0 < 1e-4) return null;
+	return [x0, y0, z0, x1, y1, z1];
+}
+function boxRead(r) {
+	const list = r.list;
+	r.stage.mapAsync(GPUMapMode.READ, 0, r.bytes).then(() => {
+		const all = r.stage.getMappedRange(0, r.bytes);
+		for (let i = 0; i < list.length; i += 4) {
+			const o = list[i], at = list[i + 1], n = list[i + 2], gen = list[i + 3];
+			if (o.boxSt !== 1) continue;
+			if ((o.gen || 0) !== gen) { o.boxSt = undefined; continue; }		// uploaded again meanwhile: read again when next drawn
+			const box = boxFromFloats(new Float32Array(all, at, n >> 2), o.boxStride, Math.floor(n / o.boxStride));
+			if (box) { o.box = box; o.boxSt = 3; boxesKnown++; } else o.boxSt = 2;
+		}
+		r.stage.unmap(); boxStages.push(r.stage);
+	}, () => { r.stage.destroy(); boxStagesMade--; for (let i = 0; i < list.length; i += 4) if (list[i].boxSt === 1) list[i].boxSt = 2; });
+}
+let boxesKnown = 0;
+// a vertex buffer uploaded again once its box was asked for (uploadBuffer): its box is read again, or never after the second time
+function boxUploaded(o) {
+	o.gen = (o.gen || 0) + 1; o.reup = (o.reup || 0) + 1;
+	o.boxSt = o.reup <= 2 ? undefined : 2;
+}
+// The game's matrices from 64 floats at f[b..] (gWorld at b, gWorldViewProj at b + 32, gViewInverse at b + 48) as row-vector matrices (the translation in the last row, as
+// the game stores them; the transpose of that is turned around): gWorld into chunkW, the camera's position into chunkCamPos, and with `wvp` gWorldViewProj into chunkWVP.
+// False when gWorld or gViewInverse is not a rigid transform (scaled or not) or a position is off the map; chunkIdent: gWorld has no translation (world-space geometry).
+const chunkW = new Float64Array(16), chunkWVP = new Float64Array(16), chunkCamPos = new Float64Array(3);
+let chunkIdent = false;
+function chunkMatrices(f, b, wvp) {
 	const v = b + 48;
-	if (f[b + 3] === 0 && f[b + 7] === 0 && f[b + 11] === 0 && f[b + 15] === 1) { chunkPos[0] = f[b + 12]; chunkPos[1] = f[b + 13]; chunkPos[4] = f[b + 12] === 0 && f[b + 13] === 0 && f[b + 14] === 0 ? 1 : 0; }
-	else if (f[b + 12] === 0 && f[b + 13] === 0 && f[b + 14] === 0 && f[b + 15] === 1) { chunkPos[0] = f[b + 3]; chunkPos[1] = f[b + 7]; chunkPos[4] = f[b + 3] === 0 && f[b + 7] === 0 && f[b + 11] === 0 ? 1 : 0; }
+	let tr;
+	if (f[b + 3] === 0 && f[b + 7] === 0 && f[b + 11] === 0 && f[b + 15] === 1) tr = false;
+	else if (f[b + 12] === 0 && f[b + 13] === 0 && f[b + 14] === 0 && f[b + 15] === 1) tr = true;
 	else return false;
-	if (f[v + 3] === 0 && f[v + 7] === 0 && f[v + 11] === 0 && f[v + 15] === 1) { chunkPos[2] = f[v + 12]; chunkPos[3] = f[v + 13]; }
-	else if (f[v + 12] === 0 && f[v + 13] === 0 && f[v + 14] === 0 && f[v + 15] === 1) { chunkPos[2] = f[v + 3]; chunkPos[3] = f[v + 7]; }
+	if (f[v + 3] === 0 && f[v + 7] === 0 && f[v + 11] === 0 && f[v + 15] === 1) { chunkCamPos[0] = f[v + 12]; chunkCamPos[1] = f[v + 13]; chunkCamPos[2] = f[v + 14]; }
+	else if (f[v + 12] === 0 && f[v + 13] === 0 && f[v + 14] === 0 && f[v + 15] === 1) { chunkCamPos[0] = f[v + 3]; chunkCamPos[1] = f[v + 7]; chunkCamPos[2] = f[v + 11]; }
 	else return false;
-	return Math.abs(chunkPos[0]) < 1e5 && Math.abs(chunkPos[1]) < 1e5 && Math.abs(chunkPos[2]) < 1e5 && Math.abs(chunkPos[3]) < 1e5;		// positions on the map
+	const W = chunkW;
+	if (!tr) for (let i = 0; i < 16; i++) W[i] = f[b + i];
+	else for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) W[r * 4 + c] = f[b + c * 4 + r];
+	if (wvp) {
+		if (!tr) for (let i = 0; i < 16; i++) chunkWVP[i] = f[b + 32 + i];
+		else for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) chunkWVP[r * 4 + c] = f[b + 32 + c * 4 + r];
+	}
+	chunkIdent = W[12] === 0 && W[13] === 0 && W[14] === 0;
+	const s = Math.max(W[0] * W[0] + W[1] * W[1] + W[2] * W[2], W[4] * W[4] + W[5] * W[5] + W[6] * W[6], W[8] * W[8] + W[9] * W[9] + W[10] * W[10]);
+	if (!(s > 1e-6 && s < 1e6)) return false;		// no scale like that on a map object (and not a NaN)
+	return Math.abs(W[12]) < 1e5 && Math.abs(W[13]) < 1e5 && Math.abs(W[14]) < 1e5 && Math.abs(chunkCamPos[0]) < 1e5 && Math.abs(chunkCamPos[1]) < 1e5 && Math.abs(chunkCamPos[2]) < 1e5;
 }
 // the floats of the vertex constant buffer at register `slot`, from its bound first constant, or null when fewer than 256 bytes
 function chunkCb(slot) {
@@ -915,40 +991,232 @@ function chunkCb(slot) {
 	chunkCbOff = c.first * 4;
 	return o.shadowF32 || (o.shadowF32 = new Float32Array(o.shadow.buffer, o.shadow.byteOffset, o.shadow.length >> 2));
 }
-let chunkCbOff = 0, chunkFrames = 0;
-// is this draw an object of the world outside the chunks around the camera?
+let chunkCbOff = 0;
+// Is this draw an object of the world that is too far, too small for its distance, or hidden (occlusion, below)? 0: draw it, 1: too far or too small, 2: hidden
 function chunkCull(vsProg, psProg, inst) {
-	if (inst > 1) return false;
+	if (inst > 1) return 0;
 	let mrt = 0;
 	for (let i = 0; i < 8; i++) if (S.rt[i].tex) mrt++;
-	if (!mrt) return false;		// depth-only passes (occlusion, shadows): never
-	if (mrt < 3 && chunkCam.frame !== presentCount) return false;		// passes with fewer targets (glass, foliage, decals drawn see-through) only after the G-buffer gave the frame's camera
+	if (!mrt) return 0;		// depth-only passes (occlusion, shadows): never
+	if (mrt < 3 && chunkCam.frame !== presentCount) return 0;		// passes with fewer targets (glass, foliage, decals drawn see-through) only after the G-buffer gave the frame's camera
 	const prog = psProg || vsProg;
 	const kind = prog.chunkKind !== undefined ? prog.chunkKind : (prog.chunkKind = chunkKind(prog.label || ''));
-	if (!kind || kind === 2) return false;		// people and vehicles: never (see below)
+	if (!kind || kind === 2) return 0;		// people and vehicles: never (see below)
 	// Skinned meshes (vehicles' bodies, people, breakable props: lamp posts, signs, fences; VS_*Skin*) are placed by their bone matrices, and the object matrix at b1 is not
 	// where they are: culled by it, car bodies vanished while their wheels (not skinned) stayed, until a hit broke the car into parts (reported: "cars are just wheels").
 	if (vsProg.skinned === undefined) vsProg.skinned = /skin/i.test(vsProg.label || '');
-	if (vsProg.skinned) return false;
+	if (vsProg.skinned) return 0;
 	// the game's matrices: at register b1 (rage_matrices); a vertex shader whose b1 never holds them is searched once at the other registers (another build may bind them
 	// elsewhere), and the register found is kept for it; one with none anywhere after 64 tries is left alone
 	let slot = vsProg.chunkSlot;
 	if (slot === undefined) {
 		const tries = (vsProg.chunkTries = (vsProg.chunkTries || 0) + 1);
-		for (const k of [1, 0, 2, 3, 4, 5, 6, 7]) { const f = chunkCb(k); if (f && chunkMatrices(f, chunkCbOff)) { slot = vsProg.chunkSlot = k; break; } }
-		if (slot === undefined) { if (tries >= 64) vsProg.chunkSlot = -1; return false; }
+		for (const k of [1, 0, 2, 3, 4, 5, 6, 7]) { const f = chunkCb(k); if (f && chunkMatrices(f, chunkCbOff, false)) { slot = vsProg.chunkSlot = k; break; } }
+		if (slot === undefined) { if (tries >= 64) vsProg.chunkSlot = -1; return 0; }
 	}
-	if (slot < 0) return false;
+	if (slot < 0) return 0;
+	const first = chunkCam.frame !== presentCount;
 	const f = chunkCb(slot);
-	if (!f || !chunkMatrices(f, chunkCbOff) || chunkPos[4]) return false;		// not the matrices this time, or the identity (instanced and world-space geometry)
-	const x = chunkPos[0], y = chunkPos[1], cx = chunkPos[2], cy = chunkPos[3];
-	if (chunkCam.frame !== presentCount) { if (mrt < 3) return false; chunkCam.frame = presentCount; chunkCam.x = cx; chunkCam.y = cy; chunkCam.cx = Math.floor(cx / CHUNK.cell); chunkCam.cy = Math.floor(cy / CHUNK.cell); chunkFrames++; }
-	else if (Math.abs(cx - chunkCam.x) > 0.05 || Math.abs(cy - chunkCam.y) > 0.05) return false;		// not the frame's main view
-	const dx = x - cx, dy = y - cy, d2 = dx * dx + dy * dy;
-	// decals (road markings, dirt) and glass follow the grid like the objects they lie on (shorter distances of their own left roads bare and windows open)
-	if (kind === 4 && CHUNK.lodTrees > 0 && d2 > CHUNK.lodTrees * CHUNK.lodTrees) return true;
-	if (kind === 5 && CHUNK.trees > 0 && d2 > CHUNK.trees * CHUNK.trees) return true;
-	return Math.abs(Math.floor(x / CHUNK.cell) - chunkCam.cx) > 1 || Math.abs(Math.floor(y / CHUNK.cell) - chunkCam.cy) > 1;
+	if (!f || !chunkMatrices(f, chunkCbOff, first && mrt >= 3) || chunkIdent) return 0;		// not the matrices this time, or no translation (instanced and world-space geometry)
+	const cx = chunkCamPos[0], cy = chunkCamPos[1], cz = chunkCamPos[2];
+	if (first) {
+		if (mrt < 3) return 0;
+		chunkCam.frame = presentCount; chunkCam.x = cx; chunkCam.y = cy; chunkCam.z = cz; chunkFrames++;
+		if (OCCL) occlFrameView();
+	} else if (Math.abs(cx - chunkCam.x) > 0.05 || Math.abs(cy - chunkCam.y) > 0.05 || Math.abs(cz - chunkCam.z) > 0.05) return 0;		// not the frame's main view
+	const vb = S.vb[0], o = vb.buf ? objs.get(vb.buf) : null;
+	if (!o || !o.gpu) return 0;
+	if (o.boxSt !== 3) { if (o.boxSt === undefined && vb.offset === 0) vbBoxRequest(o, S.layout ? objs.get(S.layout) : null, vb.stride); chunkUnsized++; return 0; }
+	if (vb.offset !== 0 || vb.stride !== o.boxStride) { chunkUnsized++; return 0; }
+	chunkSized++;
+	// the box placed in the world: its centre, and the half sizes of the box around it along the map's axes
+	const bx = o.box, W = chunkW;
+	const lx = (bx[0] + bx[3]) * 0.5, ly = (bx[1] + bx[4]) * 0.5, lz = (bx[2] + bx[5]) * 0.5, ex = (bx[3] - bx[0]) * 0.5, ey = (bx[4] - bx[1]) * 0.5, ez = (bx[5] - bx[2]) * 0.5;
+	const wx = lx * W[0] + ly * W[4] + lz * W[8] + W[12], wy = lx * W[1] + ly * W[5] + lz * W[9] + W[13], wz = lx * W[2] + ly * W[6] + lz * W[10] + W[14];
+	const hx = Math.abs(W[0]) * ex + Math.abs(W[4]) * ey + Math.abs(W[8]) * ez, hy = Math.abs(W[1]) * ex + Math.abs(W[5]) * ey + Math.abs(W[9]) * ez, hz = Math.abs(W[2]) * ex + Math.abs(W[6]) * ey + Math.abs(W[10]) * ez;
+	if (CHUNK.dist > 0) {
+		const dx = Math.max(0, Math.abs(wx - cx) - hx), dy = Math.max(0, Math.abs(wy - cy) - hy);
+		if (dx * dx + dy * dy > CHUNK.dist * CHUNK.dist) return 1;
+	}
+	if (CHUNK.tiny > 0 && kind !== 6) {
+		const dx = wx - cx, dy = wy - cy, dz = wz - cz, r2 = hx * hx + hy * hy + hz * hz, d2 = dx * dx + dy * dy + dz * dz;
+		if (d2 > r2 && r2 < CHUNK.tiny * CHUNK.tiny * d2) return 1;
+	}
+	if (OCCL && occlHidden(bx)) return 2;
+	return 0;
+}
+// ---- occlusion: what an earlier frame's depth shows is hidden is left out -----------------------------------------------------------------------------------
+// With ?occl=1 (the page's Balanced, Fast and Fastest) the depth buffer of the frame's main view is reduced on the GPU, once its G-buffer pass is over, to a grid of up to
+// 64 cells across with the nearest and the farthest depth in each cell (occlSnapshot), read back, and kept with that frame's camera: its view-projection matrix, taken from
+// the frame's first G-buffer draw (inverse(gWorld) x gWorldViewProj). An object whose box (see above), seen from that camera, lies wholly behind the farthest depth of every
+// cell it covers, with a margin, was hidden behind what was drawn there, and is left out. The grid is a frame or two old, so a box that reaches outside that view or in front
+// of its camera is drawn, everything is once the camera has moved more than OCCL_MAX_MOVE metres since (a cut, a teleport) or the grid is older than OCCL_MAX_AGE frames,
+// and for smaller moves the box is widened by how far the nearest thing in front of it can have shifted on the screen (an object coming out from behind a corner).
+// Nothing is left out because of the grid that the grid's own frame drew: what was left out is not in it, and comes back as soon as a grid shows it uncovered.
+const OCCL = isNode ? process.env.WGPU_OCCL === '1' : new URLSearchParams(self.location.search).get('occl') === '1';
+const OCCL_GRID = 64, OCCL_MAX_MOVE = 4, OCCL_MAX_AGE = 4, OCCL_REL = 1.02, OCCL_ABS = 0.3;
+const occl = { frame: -1, ds: 0, mip: 0, slice: 0, vp: [0, 0, 0, 0, 0, 1], VP: null, cam: [0, 0, 0], open: false, busy: null, ready: null, pipe: null, params: null, out: null, rbs: [], moved: 0, movedFrame: -1, snaps: 0 };
+let occlCulled = 0;
+// the frame's main view (chunkCull, its first G-buffer draw): its depth target, viewport and camera; chunkW/chunkWVP hold that draw's gWorld and gWorldViewProj
+function occlFrameView() {
+	occl.frame = presentCount; occl.ds = S.ds.tex; occl.mip = S.ds.mip; occl.slice = S.ds.slice;
+	const v = S.viewports[0];
+	if (v) for (let i = 0; i < 6; i++) occl.vp[i] = v[i]; else occl.vp[2] = 0;
+	occl.cam[0] = chunkCamPos[0]; occl.cam[1] = chunkCamPos[1]; occl.cam[2] = chunkCamPos[2];
+	occl.VP = viewProjFrom(chunkW, chunkWVP);
+	occl.open = true;		// its G-buffer pass is open now or begins with this draw (ensurePass: occlPassStart)
+}
+// a render pass begins (ensurePass, after the last one ended): the first one after the main view's G-buffer pass takes the depth grid, before any clear of its own
+function occlPassStart() {
+	let mrt = 0;
+	for (let i = 0; i < 8; i++) if (S.rt[i].tex) mrt++;
+	if (mrt >= 3 && S.ds.tex !== 0 && S.ds.tex === occl.ds && S.ds.mip === occl.mip && S.ds.slice === occl.slice) return;		// the G-buffer pass goes on
+	if (occl.open) occlSnapshot();
+}
+// inverse(W) x WVP for a W of the form [R 0; t 1] (row vectors): the camera's view-projection; null when R cannot be inverted or the result is not a perspective projection
+function viewProjFrom(W, WVP) {
+	const a = W[0], b = W[1], c = W[2], d = W[4], e = W[5], f = W[6], g = W[8], h = W[9], k = W[10];
+	const A = e * k - f * h, B = -(d * k - f * g), C = d * h - e * g, det = a * A + b * B + c * C;
+	if (!(Math.abs(det) > 1e-12)) return null;
+	const inv = [A / det, -(b * k - c * h) / det, (b * f - c * e) / det, B / det, (a * k - c * g) / det, -(a * f - c * d) / det, C / det, -(a * h - b * g) / det, (a * e - b * d) / det];
+	const t0 = W[12], t1 = W[13], t2 = W[14];
+	const s0 = -(t0 * inv[0] + t1 * inv[3] + t2 * inv[6]), s1 = -(t0 * inv[1] + t1 * inv[4] + t2 * inv[7]), s2 = -(t0 * inv[2] + t1 * inv[5] + t2 * inv[8]);
+	const VP = new Float64Array(16);
+	for (let j = 0; j < 4; j++) {
+		for (let i = 0; i < 3; i++) VP[i * 4 + j] = inv[i * 3] * WVP[j] + inv[i * 3 + 1] * WVP[4 + j] + inv[i * 3 + 2] * WVP[8 + j];
+		VP[12 + j] = s0 * WVP[j] + s1 * WVP[4 + j] + s2 * WVP[8 + j] + WVP[12 + j];
+	}
+	return occlProjection(VP) ? VP : null;
+}
+// how the view-projection maps depth: clip z = a * w + b (a perspective projection, w the distance along the view), reversed (far = 0) when b > 0; and its scale on the
+// screen (px, py: NDC per radian at the centre). Stored on the matrix; false when it is not a perspective projection.
+function occlProjection(VP) {
+	const g3x = VP[3], g3y = VP[7], g3z = VP[11], g2x = VP[2], g2y = VP[6], g2z = VP[10];
+	const l3 = g3x * g3x + g3y * g3y + g3z * g3z;
+	if (!(l3 > 1e-12) || !isFinite(l3)) return false;
+	const a = (g2x * g3x + g2y * g3y + g2z * g3z) / l3, b = VP[14] - a * VP[15];
+	const rx = g2x - a * g3x, ry = g2y - a * g3y, rz = g2z - a * g3z;
+	if (rx * rx + ry * ry + rz * rz > 1e-6 * Math.max(l3, g2x * g2x + g2y * g2y + g2z * g2z) || !(Math.abs(b) > 1e-9)) return false;
+	const l = Math.sqrt(l3);
+	VP.occA = a; VP.occB = b; VP.rev = b > 0;
+	VP.px = Math.hypot(VP[0], VP[4], VP[8]) / l; VP.py = Math.hypot(VP[1], VP[5], VP[9]) / l; VP.wl = l;
+	return VP.px > 0.05 && VP.py > 0.05;
+}
+// the depth grid's compute shader: per cell, the lowest and the highest depth of its texels of the viewport
+const OCCL_WGSL = `
+struct P { gw: u32, gh: u32, x0: u32, y0: u32, w: u32, h: u32, mip: u32, pad: u32 };
+@group(0) @binding(0) var dep: texture_depth_2d;
+@group(0) @binding(1) var<storage, read_write> outv: array<vec2<f32>>;
+@group(0) @binding(2) var<uniform> p: P;
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+	if (id.x >= p.gw || id.y >= p.gh) { return; }
+	// the texels the cell's part of the screen touches, the ones it shares with the next cell included
+	let xa = p.x0 + id.x * p.w / p.gw; let xb = p.x0 + min(p.w, ((id.x + 1u) * p.w + p.gw - 1u) / p.gw);
+	let ya = p.y0 + id.y * p.h / p.gh; let yb = p.y0 + min(p.h, ((id.y + 1u) * p.h + p.gh - 1u) / p.gh);
+	var lo = 1e30; var hi = -1e30;
+	for (var y = ya; y < yb; y++) {
+		for (var x = xa; x < xb; x++) {
+			let d = textureLoad(dep, vec2<i32>(i32(x), i32(y)), i32(p.mip));
+			lo = min(lo, d); hi = max(hi, d);
+		}
+	}
+	outv[id.y * p.gw + id.x] = vec2<f32>(lo, hi);
+}`;
+// once the frame's G-buffer pass is over (ensurePass, when the next pass is something else; present): the grid of the main view's depth, recorded into this encoder
+function occlSnapshot() {
+	occl.open = false;
+	if (occl.busy || !occl.VP || occl.frame !== presentCount) return;		// the last one is still being read
+	const t = objs.get(occl.ds);
+	if (!t || t.kind !== 'texture' || !t.tex || t.desc.sampleCount > 1 || !isDepth(t.format) || t.desc.dimension !== '2d') return;
+	const vp = occl.vp, mw = Math.max(1, t.desc.size.width >> occl.mip), mh = Math.max(1, t.desc.size.height >> occl.mip);
+	if (vp[4] !== 0 || vp[5] !== 1) return;		// a depth range other than 0..1
+	const x0 = Math.max(0, Math.round(vp[0])), y0 = Math.max(0, Math.round(vp[1])), w = Math.min(mw - x0, Math.round(vp[2])), h = Math.min(mh - y0, Math.round(vp[3]));
+	if (w < 32 || h < 32) return;
+	const gw = Math.min(OCCL_GRID, w), gh = Math.max(8, Math.min(OCCL_GRID, Math.round(gw * h / w)));
+	try {
+		if (!occl.pipe) {
+			occl.pipe = device.createComputePipeline({ layout: 'auto', compute: { module: device.createShaderModule({ code: OCCL_WGSL, label: 'occlusion grid' }), entryPoint: 'main' }, label: 'occlusion grid' });
+			occl.params = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+			occl.out = device.createBuffer({ size: OCCL_GRID * OCCL_GRID * 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+		}
+		const key = occl.mip + ':' + occl.slice;
+		if (!t.occlBG || t.occlKey !== key) {
+			const view = t.tex.createView({ dimension: '2d', baseMipLevel: occl.mip, mipLevelCount: 1, baseArrayLayer: occl.slice, arrayLayerCount: 1, aspect: 'depth-only' });
+			t.occlBG = device.createBindGroup({ layout: occl.pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: view }, { binding: 1, resource: { buffer: occl.out } }, { binding: 2, resource: { buffer: occl.params } }] });
+			t.occlKey = key;
+		}
+		device.queue.writeBuffer(occl.params, 0, new Uint32Array([gw, gh, x0, y0, w, h, 0, 0]));
+		const n = gw * gh * 8, rb = occl.rbs.pop() || device.createBuffer({ size: OCCL_GRID * OCCL_GRID * 8, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+		endPass();
+		const enc = getEncoder(), cp = enc.beginComputePass();
+		cp.setPipeline(occl.pipe); cp.setBindGroup(0, t.occlBG); cp.dispatchWorkgroups(Math.ceil(gw / 8), Math.ceil(gh / 8)); cp.end();
+		enc.copyBufferToBuffer(occl.out, 0, rb, 0, n);
+		usedInEncoder.add(t);
+		occl.busy = { rb, n, gw, gh, VP: occl.VP, cam: occl.cam.slice(), frame: presentCount, mapping: false };
+		occl.snaps++;
+	} catch (e) { logOnce('occl', 'occlusion grid: ' + (e && e.message || e)); occl.pipe = null; }
+}
+// after the submit that carries a grid's copy (flush): read it back; the depths become distances along the view (w), Infinity where nothing was drawn (the sky)
+function occlMap() {
+	const s = occl.busy;
+	s.mapping = true;
+	s.rb.mapAsync(GPUMapMode.READ, 0, s.n).then(() => {
+		const raw = new Float32Array(s.rb.getMappedRange(0, s.n)), m = s.gw * s.gh, far = new Float32Array(m), near = new Float32Array(m);
+		const a = s.VP.occA, b = s.VP.occB, rev = s.VP.rev, wl = s.VP.wl;
+		const toW = (z) => { if (rev ? !(z > 1e-7) : !(z < 1 - 1e-7)) return Infinity; const w = b / (z - a); return w > 0 ? w / wl : Infinity; };
+		for (let k = 0; k < m; k++) {
+			const lo = raw[k * 2], hi = raw[k * 2 + 1];
+			far[k] = toW(rev ? lo : hi); near[k] = toW(rev ? hi : lo);
+		}
+		s.rb.unmap(); occl.rbs.push(s.rb);
+		occl.ready = { far, near, gw: s.gw, gh: s.gh, VP: s.VP, cam: s.cam, frame: s.frame };
+		if (occl.busy === s) occl.busy = null;
+	}, () => { if (occl.busy === s) occl.busy = null; });
+}
+// is the box of the object (chunkW places it) behind the depth of the latest grid?
+function occlHidden(bx) {
+	const R = occl.ready;
+	if (!R || presentCount - R.frame > OCCL_MAX_AGE) return false;
+	if (occl.movedFrame !== presentCount) {		// how far the camera has gone since the grid's frame (once a frame)
+		occl.movedFrame = presentCount;
+		occl.moved = Math.hypot(chunkCam.x - R.cam[0], chunkCam.y - R.cam[1], chunkCam.z - R.cam[2]);
+	}
+	const moved = occl.moved;
+	if (moved > OCCL_MAX_MOVE) return false;
+	// the corners in that view: x, y and w of gWorld x VP
+	const W = chunkW, V = R.VP;
+	let m0 = 0, m1 = 0, m3 = 0, m4 = 0, m5 = 0, m7 = 0, m8 = 0, m9 = 0, m11 = 0, m12 = 0, m13 = 0, m15 = 0;
+	for (let k = 0; k < 4; k++) {
+		const v0 = V[k * 4], v1 = V[k * 4 + 1], v3 = V[k * 4 + 3];
+		const w0 = W[k], w1 = W[4 + k], w2 = W[8 + k], w3 = W[12 + k];
+		m0 += w0 * v0; m1 += w0 * v1; m3 += w0 * v3;
+		m4 += w1 * v0; m5 += w1 * v1; m7 += w1 * v3;
+		m8 += w2 * v0; m9 += w2 * v1; m11 += w2 * v3;
+		m12 += w3 * v0; m13 += w3 * v1; m15 += w3 * v3;
+	}
+	let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, wMin = Infinity;
+	for (let c = 0; c < 8; c++) {
+		const px = c & 1 ? bx[3] : bx[0], py = c & 2 ? bx[4] : bx[1], pz = c & 4 ? bx[5] : bx[2];
+		const w = px * m3 + py * m7 + pz * m11 + m15;
+		if (!(w > 0.05 * V.wl)) return false;		// reaches the camera's plane: in front of everything
+		const x = (px * m0 + py * m4 + pz * m8 + m12) / w, y = (px * m1 + py * m5 + pz * m9 + m13) / w;
+		if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; if (w < wMin) wMin = w;
+	}
+	const gw = R.gw, gh = R.gh;
+	let gx0 = Math.floor((x0 * 0.5 + 0.5) * gw), gx1 = Math.floor((x1 * 0.5 + 0.5) * gw), gy0 = Math.floor((0.5 - y1 * 0.5) * gh), gy1 = Math.floor((0.5 - y0 * 0.5) * gh);
+	if (gx0 < 0 || gy0 < 0 || gx1 >= gw || gy1 >= gh) return false;		// not all inside that view
+	const need = (wMin / V.wl - OCCL_ABS) / OCCL_REL, far = R.far;
+	if (moved > 0.01) {		// widened by the shift of the nearest thing in front of it: the angle moved/distance, in cells (1.7: the screen's edges move more than its centre)
+		let nearest = Infinity;
+		for (let gy = gy0; gy <= gy1; gy++) for (let k = gy * gw + gx0, e = gy * gw + gx1; k <= e; k++) { const n = R.near[k]; if (n < nearest) nearest = n; }
+		const ang = 1.5 * moved / Math.max(0.5, nearest);
+		const dx = Math.ceil(ang * V.px * 1.7 * gw * 0.5), dy = Math.ceil(ang * V.py * 1.7 * gh * 0.5);
+		gx0 -= dx; gx1 += dx; gy0 -= dy; gy1 += dy;
+		if (gx0 < 0 || gy0 < 0 || gx1 >= gw || gy1 >= gh) return false;
+	}
+	for (let gy = gy0; gy <= gy1; gy++) for (let k = gy * gw + gx0, e = gy * gw + gx1; k <= e; k++) if (!(far[k] < need)) return false;
+	return true;
 }
 // a water-reflection draw makes its target a reflection (redrawn every REFLECT_EVERY frames from now); anything but the sky or clouds in a water reflection undoes that for good
 function waterReflection(t, slice, ps) {
@@ -1003,6 +1271,7 @@ function createBuffer(id, size, bind, misc, stride) {
 function uploadBuffer(id, offset, size, dataOff, noOverwrite) {
 	const o = objs.get(id);
 	if (!o) return;
+	if (o.boxSeen) boxUploaded(o);		// its box (draw distance) is read again
 	if (o.shadow) { o.shadow.set(u8.subarray(dataOff, dataOff + size), offset); o.version++; }
 	if (debugDraw && o.gpu && !o.shadow) { if (!o.dbg) o.dbg = new Uint8Array(o.size); o.dbg.set(u8.subarray(dataOff, dataOff + size), offset); }
 	if (o.gpu) {
@@ -1920,6 +2189,7 @@ function ensurePass() {
 	const key = rtKey || (rtKey = S.rt.map((r) => r.tex + ':' + r.mip + ':' + r.slice + ':' + r.fmt).join(',') + '/' + S.ds.tex + ':' + S.ds.mip + ':' + S.ds.slice + ':' + S.ds.fmt + ':' + S.ds.flags);
 	if (pass && key === passKey) return true;
 	endPass();
+	if (OCCL && occl.open) occlPassStart();		// the main view's G-buffer pass may be over: its depth grid (occlusion)
 	const colorAttachments = [], rtInfo = [];
 	let samples = 1, any = false, passW = 1, passH = 1;
 	for (let i = 0; i < 8; i++) {
@@ -2262,7 +2532,7 @@ function doDraw(p) {
 	let vsProg = shaderProgram(vsObj);
 	let psProg = psObj ? shaderProgram(psObj) : null;
 	if (!vsProg || (psObj && !psProg)) { skipDraw('if (!vsProg || (psObj && !psProg)) { skippedDraws++; return;'); return; }
-	if (CHUNK.cell > 0 && kind < 4 && chunkCull(vsProg, psProg, inst)) { chunkCulled++; return; }		// outside the chunks around the camera
+	if ((CHUNK.dist > 0 || CHUNK.tiny > 0 || OCCL) && kind < 4) { const c = chunkCull(vsProg, psProg, inst); if (c) { if (c === 1) chunkCulled++; else occlCulled++; return; } }		// too far, too small or hidden
 	if (vsProg.overTex || (psProg && psProg.overTex)) {		// more textures than this device allows per stage: a variant for the textures bound now (fitTextures)
 		const vv = vsProg.overTex ? fitTextures(vsObj, vsProg, 0) : null, pv = psProg && psProg.overTex ? fitTextures(psObj, psProg, 1) : null;
 		if ((vsProg.overTex && !vv) || (psProg && psProg.overTex && !pv)) { skipDraw('texture limit'); return; }
@@ -3371,7 +3641,7 @@ async function present(id) {
 			dbgChannel.postMessage({ limit: Atomics.load(i32, dbgIdx), total: Atomics.load(i32, dbgIdx + 1), last: dbgLastLabel });
 		}
 	}
-	if (CHUNK_AUTO > 0 && CHUNK_BASE.cell > 0) {		// chunks that follow the frame rate (CHUNK_AUTO)
+	if (CHUNK_AUTO > 0 && (CHUNK_BASE.dist > 0 || CHUNK_BASE.tiny > 0)) {		// a draw distance that follows the frame rate (CHUNK_AUTO)
 		const tn = performance.now();
 		if (!chunkWin.t) { chunkWin.t = tn; chunkWin.n = 0; chunkWin.idle = chunkWin.wait = 0; chunkWin.gpu = gpuBusyMs(tn); }
 		else if (++chunkWin.n && tn - chunkWin.t >= 1000) {
@@ -3383,10 +3653,10 @@ async function present(id) {
 	if (!isNode) {		// the page's FPS counter (index.html, '=' key): presented frames per second, twice a second, and where a frame's time went (per frame): this worker waiting
 		// for the game's commands (idle), waiting for the GPU (wait: a frame slot or a fence), working (the rest: translating draws), and how long the GPU had work (gpu, see gpuTrack)
 		const tn = performance.now();
+		if (!fpsChannel) { fpsChannel = new BroadcastChannel('game-fps'); fpsChannel.onmessage = (e) => { if (e.data && e.data.overlay !== undefined) overlayOn = !!e.data.overlay; }; }
 		fpsOverlayN++;
-		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
+		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
 		else if (tn - fpsOverlayT >= 500) {
-			if (!fpsChannel) fpsChannel = new BroadcastChannel('game-fps');
 			const n = Math.max(1, fpsOverlayN), ms = (tn - fpsOverlayT) / n, busy = gpuBusyMs(tn), gpuPer = (busy - ov.gpu) / n;
 			const byEffect = new Map();
 			for (const pr of ovProgs) { const l = pr.label || '?', k = l.indexOf('::'), e = k > 0 ? l.slice(0, k) : l; byEffect.set(e, (byEffect.get(e) || 0) + pr.ovN); pr.ovN = 0; }
@@ -3394,10 +3664,12 @@ async function present(id) {
 			const top = [...byEffect].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([e, c]) => [e, c / n]);
 			fpsChannel.postMessage({ fps: fpsOverlayN * 1000 / (tn - fpsOverlayT), ms, draws: (drawCount - ov.draws) / n, idle: ov.idle / n, wait: ov.wait / n, pipe: ov.pipe / n, up: ov.up / n, gpu: Math.min(ms, gpuPer),
 				top, refl: ov.refl / n, reflSkip: ov.reflSkip / n, reflEvery: REFLECT_EVERY, merged: (clearsMerged - ov.merged) / n, reused: (packsReused - ov.reused) / n, noop: (noopDraws - ov.noop) / n,
-				culled: (chunkCulled - ov.culled) / n, chunk: CHUNK, chunkAuto: CHUNK_AUTO, chunkActive: chunkFrames > ov.chunkFrames, chip: gpuTiming.result,
+				culled: (chunkCulled - ov.culled) / n, chunk: CHUNK, chunkAuto: CHUNK_AUTO, chunkActive: chunkFrames > ov.chunkFrames, chip: overlayOn ? gpuTiming.result : null, overlay: overlayOn,
+				sizedPct: chunkSized + chunkUnsized - ov.sized > 0 ? Math.round(100 * (chunkSized - ov.sizedK) / (chunkSized + chunkUnsized - ov.sized)) : -1,
+				occl: OCCL, hidden: (occlCulled - ov.hidden) / n, occlOn: OCCL && occl.ready !== null && presentCount - occl.ready.frame <= OCCL_MAX_AGE,
 				// shader modules and pipelines made per second: each is compiled by Chrome's GPU process (shown there only as "GPU busy"), many while new places stream in
 				newShaders: (shaderModuleCount - ov.mods) * 1000 / (tn - fpsOverlayT), newPipelines: (pipeCreates + aheadMade - ov.pipes) * 1000 / (tn - fpsOverlayT) });
-			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade;
+			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled;
 			fpsOverlayN = 0; fpsOverlayT = tn; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = busy; ov.draws = drawCount;
 		}
 	}
@@ -3448,10 +3720,11 @@ async function present(id) {
 		await screenshot(id, shotPrefix + String(presentCount).padStart(6, '0') + '.png');
 		for (const tid of (isNode ? process.env.WGPU_SHOT_TEXS || '' : '').split(',').filter(Boolean)) await screenshot(+tid, shotPrefix + 'tex' + tid + '_' + String(presentCount).padStart(6, '0') + '.png');
 	}
+	if (OCCL && occl.open) occlSnapshot();		// the main view's G-buffer pass was the frame's last: its depth grid now
 	const timedRead = gpuTiming.state === 1 ? gpuTimingResolve() : 0;		// a sampled frame's pass times: resolved with this frame's last commands
 	flush('present');
 	if (timedRead) gpuTimingRead(timedRead);
-	if (gpuTiming.state === 0 && gpuTiming.set && worldSent && performance.now() - gpuTiming.lastT >= 2000) { gpuTiming.state = 1; gpuTiming.passes.length = 0; gpuTiming.cur = null; }		// the next frame is sampled
+	if (gpuTiming.state === 0 && gpuTiming.set && worldSent && overlayOn && performance.now() - gpuTiming.lastT >= 2000) { gpuTiming.state = 1; gpuTiming.passes.length = 0; gpuTiming.cur = null; }		// the next frame is sampled
 	frameSlotDone[ubo.slot] = device.queue.onSubmittedWorkDone();
 	ubo.slot = (ubo.slot + 1) % FRAME_SLOTS; ubo.chunk = 0; ubo.off = 0; ubo.frame++;
 	const tw0 = performance.now();

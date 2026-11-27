@@ -20,9 +20,10 @@ self.onmessage = (ev) => {
 	if (m.gpuLimits) gq.set('limits', m.gpuLimits);		// ?limits=name:value,...: a smaller device (diagnosis of weaker GPUs)
 	if (m.nanSafe) gq.set('nansafe', m.nanSafe);		// ?nansafe=1/0: D3D's NaN rules for min/max/saturate forced on/off (wgpu_worker.js d3dNanRules; default: off on Windows)
 	if (m.reflect > 1) gq.set('reflect', String(m.reflect));		// the reflection cube map redrawn every n-th frame per face (wgpu_worker.js REFLECT_EVERY)
-	if (m.chunk && m.chunk !== '0') gq.set('chunk', String(m.chunk));		// only the world in the 3x3 chunks around the camera is drawn (wgpu_worker.js CHUNK)
+	if (m.chunk && m.chunk !== '0') gq.set('chunk', String(m.chunk));		// the draw distance by object size (wgpu_worker.js CHUNK)
+	if (m.occl) gq.set('occl', '1');		// what an earlier frame's depth shows hidden is not drawn (wgpu_worker.js OCCL)
 	if (m.aheadPlay !== undefined && m.aheadPlay !== 1) gq.set('aheadplay', String(m.aheadPlay));		// pipelines compiled ahead while playing (wgpu_worker.js AHEAD_PLAY)
-	if (m.chunk && m.chunk !== '0' && m.chunkAuto > 0) gq.set('chunkauto', m.chunkAuto.toFixed(1));		// the chunk size follows the frame rate (CHUNK_AUTO: the target frame time in ms)
+	if (m.chunk && m.chunk !== '0' && m.chunkAuto > 0) gq.set('chunkauto', m.chunkAuto.toFixed(1));		// the draw distance follows the frame rate (CHUNK_AUTO: the target frame time in ms)
 	if (m.nanHunt) gq.set('nanhunt', '1');		// ?nanhunt=1: find the first draw that writes NaN into an HDR target, shown on the page
 	const B = m.base || '';		// the page's URL prefix for everything it loads (index.html BASE): /b/<build> on the PHP host, empty otherwise; the page's own folder on GitHub Pages
 	// m.local (index.html on GitHub Pages): the game files come from the folder the player picked, not from the host: { wasm: File, manifestText: the manifest the
@@ -162,7 +163,7 @@ self.onmessage = (ev) => {
 			}],
 		};
 		// __log/__logFlush come from prejs.js, which only exists once game.js is loaded: note the start line in the console.
-		console.log('loader: starting engine: ' + m.args.join(' ') + ' (cores ' + m.cores + ', pipeline seed ' + (m.lowMemory || m.lowSeed ? 'low' : 'full') + ', reflections every ' + (m.reflect || 1) + ' frame(s), chunks ' + (m.chunk || '0') + (m.chunkAuto > 0 ? ' aiming at ' + Math.round(1000 / m.chunkAuto) + ' fps' : '') + ', compiling ahead in play ' + (m.aheadPlay !== undefined ? m.aheadPlay : 1) + ')');
+		console.log('loader: starting engine: ' + m.args.join(' ') + ' (cores ' + m.cores + ', pipeline seed ' + (m.lowMemory || m.lowSeed ? 'low' : 'full') + ', reflections every ' + (m.reflect || 1) + ' frame(s), draw distance ' + (m.chunk || '0') + (m.chunkAuto > 0 ? ' aiming at ' + Math.round(1000 / m.chunkAuto) + ' fps' : '') + ', occlusion ' + (m.occl ? 'on' : 'off') + ', compiling ahead in play ' + (m.aheadPlay !== undefined ? m.aheadPlay : 1) + ')');
 		importScripts(B + '/game.js');
 	};
 	gpu.onerror = (e) => console.error('gpu worker failed to load: ' + e.message);
