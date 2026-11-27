@@ -19,6 +19,7 @@ self.onmessage = (ev) => {
 	if (m.shotRt) gq.set('shotrt', '1');		// ?shotrt=1 (with ?shot=N): every render target of one frame after the world is shown goes to the dev server (diagnosis)
 	if (m.gpuLimits) gq.set('limits', m.gpuLimits);		// ?limits=name:value,...: a smaller device (diagnosis of weaker GPUs)
 	if (m.nanSafe) gq.set('nansafe', m.nanSafe);		// ?nansafe=1/0: D3D's NaN rules for min/max/saturate forced on/off (wgpu_worker.js d3dNanRules; default: off on Windows)
+	if (m.reflect > 1) gq.set('reflect', String(m.reflect));		// the reflection cube map redrawn every n-th frame per face (wgpu_worker.js REFLECT_EVERY)
 	if (m.nanHunt) gq.set('nanhunt', '1');		// ?nanhunt=1: find the first draw that writes NaN into an HDR target, shown on the page
 	const B = m.base || '';		// the page's URL prefix for everything it loads (index.html BASE): /b/<build> on the PHP host, empty otherwise; the page's own folder on GitHub Pages
 	// m.local (index.html on GitHub Pages): the game files come from the folder the player picked, not from the host: { wasm: File, manifestText: the manifest the
@@ -158,7 +159,7 @@ self.onmessage = (ev) => {
 			}],
 		};
 		// __log/__logFlush come from prejs.js, which only exists once game.js is loaded: note the start line in the console.
-		console.log('loader: starting engine: ' + m.args.join(' ') + ' (cores ' + m.cores + ', pipeline seed ' + (m.lowMemory || m.lowSeed ? 'low' : 'full') + ')');
+		console.log('loader: starting engine: ' + m.args.join(' ') + ' (cores ' + m.cores + ', pipeline seed ' + (m.lowMemory || m.lowSeed ? 'low' : 'full') + ', reflections every ' + (m.reflect || 1) + ' frame(s))');
 		importScripts(B + '/game.js');
 	};
 	gpu.onerror = (e) => console.error('gpu worker failed to load: ' + e.message);
