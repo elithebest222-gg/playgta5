@@ -141,7 +141,7 @@ let noF32Filter = false, noD32S8 = false, noRG11 = false;
 let mem = null, memBuffer = null, i32 = null, u32 = null, f32 = null, u8 = null, ringBase = 0, ringSize = 0;
 let canvas = null, canvasCtx = null, canvasFormat = null, blit = null, canvasConfigured = false;
 let fpsChannel = null, fpsOverlayN = 0, fpsOverlayT = 0, overlayOn = false;		// overlayOn: the page shows the overlay ('=' key): only then are frames timed on the chip (gpuTiming)
-const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0, merged: 0, reused: 0, noop: 0, culled: 0, chunkFrames: 0, mods: 0, pipes: 0, sized: 0, sizedK: 0, hidden: 0 };		// merged/reused/noop: the counters' values at the last report		// the frame-rate overlay's sums since its last report (present)
+const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0, merged: 0, reused: 0, noop: 0, culled: 0, chunkFrames: 0, mods: 0, pipes: 0, sized: 0, sizedK: 0, hidden: 0, passes: 0, submits: 0, bgs: 0, upBytes: 0, staged: 0 };		// merged/reused/noop: the counters' values at the last report		// the frame-rate overlay's sums since its last report (present)
 const ovProgs = [];		// the programs drawn since the overlay's last report, each with its count in `ovN` (summed per effect for the report)
 // The GPU's share of a frame (the overlay's "GPU"): the time during which some submitted work is not finished yet, from the submit to the moment this worker learns that the
 // newest submit is done (its event loop gets a turn at least every 2 ms). It includes the GPU process's own work on the commands, so it is a little long, never short.
@@ -251,15 +251,19 @@ let passSt = newPassSt();
 // buffer of every draw; nothing iterates it.)
 let encEpoch = 1, submits = 0, submits0 = 0;
 const usedInEncoder = { add(o) { if (o) o.enc = encEpoch; }, has(o) { return !!o && o.enc === encEpoch; }, clear() { encEpoch++; } };
-const flushReasons = new Map();		// submits per reason since the last fps line
+const flushReasons = new Map(), ovReasons = new Map();		// submits per reason since the last fps line / the overlay's last report
+let passesBegun = 0;
 function flush(reason) {
 	const tf0 = performance.now();
-	if (encoder || pass) { const r = reason || 'other'; flushReasons.set(r, (flushReasons.get(r) || 0) + 1); }
+	if (encoder || pass) { const r = reason || 'other'; flushReasons.set(r, (flushReasons.get(r) || 0) + 1); ovReasons.set(r, (ovReasons.get(r) || 0) + 1); }
 	endPass();
 	if (dirtyChunks.size) flushUniforms();
 	const resolves = pendingResolve.length ? recordResolves() : null;		// into this encoder: no command buffer of its own
 	const boxes = boxRequests.length ? boxEncode(getEncoder()) : null;		// vertex buffers whose boxes are read back (draw distance)
 	if (encoder) { device.queue.submit([encoder.finish()]); encoder = null; onSubmitted(); submits++; counterSlot = 0; if (!isNode) gpuTrack(); }
+	upStage.off = 0;		// staging writes from now on land after this submit's copies
+	if (renameRetired.length) renameRelease();
+	if (deferredDestroys.length) { for (const g of deferredDestroys) g.destroy(); deferredDestroys = []; }
 	if (resolves) mapResolves(resolves);
 	if (boxes) boxRead(boxes);
 	if (occl.busy && !occl.busy.mapping) occlMap();		// the depth grid's copy went with this submit
@@ -754,6 +758,12 @@ async function initDevice(msg) {
 	noD32S8 = !device.features.has('depth32float-stencil8');
 	noRG11 = !device.features.has('rg11b10ufloat-renderable');
 	if (!isNode && device.features.has('timestamp-query')) gpuTimingInit();
+	if (!isNode && !GPUCommandEncoder.prototype.passCounted) {		// the overlay's passes per frame: every render and compute pass this worker begins
+		const r = GPUCommandEncoder.prototype.beginRenderPass, c = GPUCommandEncoder.prototype.beginComputePass;
+		GPUCommandEncoder.prototype.beginRenderPass = function (d) { passesBegun++; return r.call(this, d); };
+		GPUCommandEncoder.prototype.beginComputePass = function (d) { passesBegun++; return c.call(this, d); };
+		GPUCommandEncoder.prototype.passCounted = true;
+	}
 	const lacking = want.filter((f) => !device.features.has(f));
 	if (lacking.length) logLine('this device lacks: ' + lacking.join(', ') + (noF32Filter || noD32S8 || noRG11 ? ' (worked around: ' + [noF32Filter && '32-bit float textures filtered through 16-bit copies', noD32S8 && '24-bit depth', noRG11 && 'rgba16float HDR targets'].filter(Boolean).join(', ') + ')' : ''));
 	if (!isNode) {
@@ -877,9 +887,10 @@ function chunkApplyScale(scale) {
 	if (CHUNK_BASE.tiny > 0) CHUNK.tiny = Math.min(CHUNK_MAX_TINY, CHUNK_BASE.tiny / scale);
 }
 // 0: never culled, 1: the world's solid objects (buildings, props), 2: people and vehicles, 3: decals, 4: the stand-ins of distant trees (trees_lod*), 5: trees,
-// 6: see-through glass and fences of the world (blended or alpha-tested)
+// 6: see-through glass and fences of the world (blended or alpha-tested), 7: the ground's tiles (terrain*: only when hidden, never for distance or size)
 function chunkKind(label) {
 	const k = label.indexOf('::'), e = (k > 0 ? label.slice(0, k) : label).toLowerCase();
+	if (/^terrain/.test(e)) return 7;
 	if (/^(terrain|water|sky|cloud|im$|imms|postfx|deferred|lighting|ptfx|ptxgpu|rmptfx|debug|scaleform|radar|rage_|shadow|ssao|hdao|blur|cascade|mirror|billboard|grass|light|spot|point|capsule|tiled|volume|fog|lens|rain|snow|corona|vfx|cubemap|reflect|seethrough|occlu|stencil|copy|clear|downsample|gpu|cs_|directional|distortion|memory|adaptive|avg|damage|distance|dof|exposure|golf|mlaa|silhouette|skinblend|waveform|rope|cable|blend_2lyr)/.test(e)) return 0;
 	if (/terrain|_wet|shadow/.test(e)) return 0;		// the ground (wet ground layers too) and shadow-only geometry
 	if (/^(ped|cloth|vehicle|weapon|hair)/.test(e)) return 2;
@@ -1001,9 +1012,11 @@ function chunkCull(vsProg, psProg, inst) {
 	if (mrt < 3 && chunkCam.frame !== presentCount) return 0;		// passes with fewer targets (glass, foliage, decals drawn see-through) only after the G-buffer gave the frame's camera
 	const prog = psProg || vsProg;
 	const kind = prog.chunkKind !== undefined ? prog.chunkKind : (prog.chunkKind = chunkKind(prog.label || ''));
-	if (!kind || kind === 2) return 0;		// people and vehicles: never (see below)
+	if (!kind) return 0;
 	// Skinned meshes (vehicles' bodies, people, breakable props: lamp posts, signs, fences; VS_*Skin*) are placed by their bone matrices, and the object matrix at b1 is not
 	// where they are: culled by it, car bodies vanished while their wheels (not skinned) stayed, until a hit broke the car into parts (reported: "cars are just wheels").
+	// The rigid parts of people and vehicles (wheels, lights, props, weapons) are placed by it, and are only left out when too small for their distance (a wheel 60 m away
+	// on Fastest: a pixel or two), never for distance or because hidden (they move: the depth grid is a frame or two old).
 	if (vsProg.skinned === undefined) vsProg.skinned = /skin/i.test(vsProg.label || '');
 	if (vsProg.skinned) return 0;
 	// the game's matrices: at register b1 (rage_matrices); a vertex shader whose b1 never holds them is searched once at the other registers (another build may bind them
@@ -1020,7 +1033,7 @@ function chunkCull(vsProg, psProg, inst) {
 	if (!f || !chunkMatrices(f, chunkCbOff, first && mrt >= 3) || chunkIdent) return 0;		// not the matrices this time, or no translation (instanced and world-space geometry)
 	const cx = chunkCamPos[0], cy = chunkCamPos[1], cz = chunkCamPos[2];
 	if (first) {
-		if (mrt < 3) return 0;
+		if (mrt < 3 || kind === 2) return 0;		// the frame's camera from a world object of the G-buffer (first-person arms and weapons may have a projection of their own)
 		chunkCam.frame = presentCount; chunkCam.x = cx; chunkCam.y = cy; chunkCam.z = cz; chunkFrames++;
 		if (OCCL) occlFrameView();
 	} else if (Math.abs(cx - chunkCam.x) > 0.05 || Math.abs(cy - chunkCam.y) > 0.05 || Math.abs(cz - chunkCam.z) > 0.05) return 0;		// not the frame's main view
@@ -1034,7 +1047,8 @@ function chunkCull(vsProg, psProg, inst) {
 	const lx = (bx[0] + bx[3]) * 0.5, ly = (bx[1] + bx[4]) * 0.5, lz = (bx[2] + bx[5]) * 0.5, ex = (bx[3] - bx[0]) * 0.5, ey = (bx[4] - bx[1]) * 0.5, ez = (bx[5] - bx[2]) * 0.5;
 	const wx = lx * W[0] + ly * W[4] + lz * W[8] + W[12], wy = lx * W[1] + ly * W[5] + lz * W[9] + W[13], wz = lx * W[2] + ly * W[6] + lz * W[10] + W[14];
 	const hx = Math.abs(W[0]) * ex + Math.abs(W[4]) * ey + Math.abs(W[8]) * ez, hy = Math.abs(W[1]) * ex + Math.abs(W[5]) * ey + Math.abs(W[9]) * ez, hz = Math.abs(W[2]) * ex + Math.abs(W[6]) * ey + Math.abs(W[10]) * ez;
-	if (CHUNK.dist > 0) {
+	if (kind === 7) return OCCL && occlHidden(bx) ? 2 : 0;		// the ground: only when hidden (it reaches the horizon)
+	if (CHUNK.dist > 0 && kind !== 2) {
 		const dx = Math.max(0, Math.abs(wx - cx) - hx), dy = Math.max(0, Math.abs(wy - cy) - hy);
 		if (dx * dx + dy * dy > CHUNK.dist * CHUNK.dist) return 1;
 	}
@@ -1042,7 +1056,7 @@ function chunkCull(vsProg, psProg, inst) {
 		const dx = wx - cx, dy = wy - cy, dz = wz - cz, r2 = hx * hx + hy * hy + hz * hz, d2 = dx * dx + dy * dy + dz * dz;
 		if (d2 > r2 && r2 < CHUNK.tiny * CHUNK.tiny * d2) return 1;
 	}
-	if (OCCL && occlHidden(bx)) return 2;
+	if (OCCL && kind !== 2 && occlHidden(bx)) return 2;
 	return 0;
 }
 // ---- occlusion: what an earlier frame's depth shows is hidden is left out -----------------------------------------------------------------------------------
@@ -1055,7 +1069,7 @@ function chunkCull(vsProg, psProg, inst) {
 // Nothing is left out because of the grid that the grid's own frame drew: what was left out is not in it, and comes back as soon as a grid shows it uncovered.
 const OCCL = isNode ? process.env.WGPU_OCCL === '1' : new URLSearchParams(self.location.search).get('occl') === '1';
 const OCCL_GRID = 64, OCCL_MAX_MOVE = 4, OCCL_MAX_AGE = 4, OCCL_REL = 1.02, OCCL_ABS = 0.3;
-const occl = { frame: -1, ds: 0, mip: 0, slice: 0, vp: [0, 0, 0, 0, 0, 1], VP: null, cam: [0, 0, 0], open: false, busy: null, ready: null, pipe: null, params: null, out: null, rbs: [], moved: 0, movedFrame: -1, snaps: 0 };
+const occl = { frame: -1, ds: 0, mip: 0, slice: 0, vp: [0, 0, 0, 0, 0, 1], VP: null, cam: [0, 0, 0], open: false, busy: null, ready: null, pipe: null, params: null, out: null, rbs: [], moved: 0, movedFrame: -1, snaps: 0, why: '' };
 let occlCulled = 0;
 // the frame's main view (chunkCull, its first G-buffer draw): its depth target, viewport and camera; chunkW/chunkWVP hold that draw's gWorld and gWorldViewProj
 function occlFrameView() {
@@ -1064,6 +1078,7 @@ function occlFrameView() {
 	if (v) for (let i = 0; i < 6; i++) occl.vp[i] = v[i]; else occl.vp[2] = 0;
 	occl.cam[0] = chunkCamPos[0]; occl.cam[1] = chunkCamPos[1]; occl.cam[2] = chunkCamPos[2];
 	occl.VP = viewProjFrom(chunkW, chunkWVP);
+	occl.why = occl.VP ? '' : 'the camera is not a perspective view';		// (occlSnapshot may find another reason)
 	occl.open = true;		// its G-buffer pass is open now or begins with this draw (ensurePass: occlPassStart)
 }
 // a render pass begins (ensurePass, after the last one ended): the first one after the main view's G-buffer pass takes the depth grid, before any clear of its own
@@ -1128,11 +1143,13 @@ function occlSnapshot() {
 	occl.open = false;
 	if (occl.busy || !occl.VP || occl.frame !== presentCount) return;		// the last one is still being read
 	const t = objs.get(occl.ds);
-	if (!t || t.kind !== 'texture' || !t.tex || t.desc.sampleCount > 1 || !isDepth(t.format) || t.desc.dimension !== '2d') return;
+	if (!t || t.kind !== 'texture' || !t.tex || !isDepth(t.format)) { occl.why = 'no depth buffer in the main view'; return; }
+	if (t.desc.sampleCount > 1 || t.desc.dimension !== '2d') { occl.why = 'a multisampled or layered depth buffer'; return; }
 	const vp = occl.vp, mw = Math.max(1, t.desc.size.width >> occl.mip), mh = Math.max(1, t.desc.size.height >> occl.mip);
-	if (vp[4] !== 0 || vp[5] !== 1) return;		// a depth range other than 0..1
+	if (vp[4] !== 0 || vp[5] !== 1) { occl.why = 'a depth range of ' + vp[4] + '..' + vp[5]; return; }		// a depth range other than 0..1
 	const x0 = Math.max(0, Math.round(vp[0])), y0 = Math.max(0, Math.round(vp[1])), w = Math.min(mw - x0, Math.round(vp[2])), h = Math.min(mh - y0, Math.round(vp[3]));
-	if (w < 32 || h < 32) return;
+	if (w < 32 || h < 32) { occl.why = 'a viewport of ' + w + 'x' + h; return; }
+	occl.why = '';
 	const gw = Math.min(OCCL_GRID, w), gh = Math.max(8, Math.min(OCCL_GRID, Math.round(gw * h / w)));
 	try {
 		if (!occl.pipe) {
@@ -1155,7 +1172,7 @@ function occlSnapshot() {
 		usedInEncoder.add(t);
 		occl.busy = { rb, n, gw, gh, VP: occl.VP, cam: occl.cam.slice(), frame: presentCount, mapping: false };
 		occl.snaps++;
-	} catch (e) { logOnce('occl', 'occlusion grid: ' + (e && e.message || e)); occl.pipe = null; }
+	} catch (e) { logOnce('occl', 'occlusion grid: ' + (e && e.message || e)); occl.pipe = null; occl.why = 'the depth grid failed: ' + String(e && e.message || e).slice(0, 60); }
 }
 // after the submit that carries a grid's copy (flush): read it back; the depths become distances along the view (w), Infinity where nothing was drawn (the sky)
 function occlMap() {
@@ -1173,6 +1190,18 @@ function occlMap() {
 		occl.ready = { far, near, gw: s.gw, gh: s.gh, VP: s.VP, cam: s.cam, frame: s.frame };
 		if (occl.busy === s) occl.busy = null;
 	}, () => { if (occl.busy === s) occl.busy = null; });
+}
+// for the overlay: is occlusion working now, and if not, why
+function occlActive() {
+	const R = occl.ready;
+	return !!R && presentCount - R.frame <= OCCL_MAX_AGE && !(occl.movedFrame === presentCount && occl.moved > OCCL_MAX_MOVE);
+}
+function occlStatus() {
+	if (occlActive()) return '';
+	if (occl.why) return occl.why;
+	if (chunkCam.frame < presentCount - 2) return 'no main view found';
+	const R = occl.ready;
+	return !R ? 'no depth yet' : presentCount - R.frame > OCCL_MAX_AGE ? 'depth too old' : 'camera moving fast';
 }
 // is the box of the object (chunkW places it) behind the depth of the latest grid?
 function occlHidden(bx) {
@@ -1268,6 +1297,85 @@ function createBuffer(id, size, bind, misc, stride) {
 	objs.set(id, o);
 }
 
+// ---- uploads into resources this encoder already uses -------------------------------------------------------------------------------------------------------
+// D3D11 lets the game overwrite a buffer or texture that earlier draws of the frame read (a dynamic buffer mapped with DISCARD, UpdateSubresource, a font texture getting
+// new glyphs), and those draws must still see the old contents. That used to submit everything recorded so far first (flush): a whole submit each time, which on a
+// 4-thread Chromebook costs the GPU process a millisecond or more, and splits the frame. Now the new data goes into a staging buffer (queue.writeBuffer, which lands on
+// the queue before this encoder runs) and a copy into the resource is recorded right here, between the draws before (they read the old contents) and after (the new).
+// Staging space is taken in order from UPLOAD_STAGE_BYTES and only reused after the next submit (a write into it lands before this encoder runs). The old flush is
+// the fallback when the staging buffer is full or the copy cannot be expressed (an offset not a multiple of 4, depth or multisampled textures).
+const UPLOAD_STAGE_BYTES = 8 << 20;
+const upStage = { buf: null, off: 0 };
+let stagedUploads = 0, deferredDestroys = [];
+function stageAlloc(n) {		// the 256-aligned offset of n bytes in the staging buffer for this encoder, or -1
+	if (!upStage.buf) upStage.buf = device.createBuffer({ size: UPLOAD_STAGE_BYTES, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+	const at = (upStage.off + 255) & ~255;
+	if (at + n > UPLOAD_STAGE_BYTES) return -1;
+	upStage.off = at + n;
+	return at;
+}
+function stagedBufferUpload(o, offset, size, dataOff) {
+	const n4 = (size + 3) & ~3;
+	if ((offset & 3) || offset + n4 > o.bytes) return false;
+	const at = stageAlloc(n4);
+	if (at < 0) return false;
+	const n = size & ~3;
+	if (n) device.queue.writeBuffer(upStage.buf, at, u8, dataOff, n);
+	if (size & 3) { const tail = new Uint8Array(4); tail.set(u8.subarray(dataOff + n, dataOff + size)); device.queue.writeBuffer(upStage.buf, at + n, tail); }
+	endPass();
+	getEncoder().copyBufferToBuffer(upStage.buf, at, o.gpu, offset, n4);
+	usedInEncoder.add(o);
+	stagedUploads++;
+	return true;
+}
+// A vertex or index buffer (nothing else: bind groups hold the others) whose whole contents are replaced while this encoder uses it gets a fresh GPU buffer instead
+// (renamed, as D3D drivers do for a DISCARD map): the draws recorded so far keep the old one, the upload goes into the new one, and no copy or pass break is needed.
+// Old buffers go back to a pool once the GPU is done with them (RENAME_POOL_BYTES at most kept).
+const RENAME_POOL_BYTES = 64 << 20;
+const renamePool = new Map();		// 'bytes|usage' -> [GPUBuffer]
+let renameRetired = [], renamePoolBytes = 0, renamedBuffers = 0;
+function renamable(o) { return (o.bind & 3) !== 0 && (o.bind & (4 | 8 | 0x10 | 0x80)) === 0 && (o.misc & 0x10) === 0 && !o.counter; }
+function renameBuffer(o) {
+	const usage = o.gpu.usage, key = o.bytes + '|' + usage, l = renamePool.get(key), b = l && l.pop();
+	if (b) renamePoolBytes -= o.bytes;
+	renameRetired.push(key, o.gpu, o.bytes);
+	o.gpu = b || device.createBuffer({ size: o.bytes, usage });
+	o.enc = 0;		// the new buffer: not used by this encoder yet
+	renamedBuffers++;
+}
+function renameRelease() {		// after a submit: the buffers it retired go back to the pool once the GPU has run it
+	const r = renameRetired;
+	renameRetired = [];
+	device.queue.onSubmittedWorkDone().then(() => {
+		for (let i = 0; i < r.length; i += 3) {
+			if (renamePoolBytes + r[i + 2] > RENAME_POOL_BYTES) { r[i + 1].destroy(); continue; }
+			let l = renamePool.get(r[i]);
+			if (!l) renamePool.set(r[i], l = []);
+			l.push(r[i + 1]); renamePoolBytes += r[i + 2];
+		}
+	});
+}
+// rows of `w` x `h` x `d` texels (bytesPerRow `bpr` apart, images rowsPerImage rows apart) into the staging buffer with 256-byte rows, copied into the texture here
+function stagedTextureUpload(o, mip, origin, data, bpr, rowsPerImage, w, h, d) {
+	const f = o.desc.format;
+	if (isDepth(f) || o.desc.sampleCount > 1 || !o.tex) return false;
+	const bi = blockInfo(f), rowBytes = Math.ceil(w / bi.bw) * bi.bytes, rows = Math.ceil(h / bi.bh), abpr = (rowBytes + 255) & ~255, srcImage = (rowsPerImage || rows) * bpr;
+	if (rowBytes > bpr) return false;
+	const at = stageAlloc(abpr * rows * d);
+	if (at < 0) return false;
+	if (bpr === abpr && srcImage === rows * abpr && data.length >= abpr * rows * d) device.queue.writeBuffer(upStage.buf, at, data, 0, abpr * rows * d);
+	else {
+		const tmp = new Uint8Array(abpr * rows * d);
+		for (let k = 0; k < d; k++) for (let r = 0; r < rows; r++) { const src = k * srcImage + r * bpr; tmp.set(data.subarray(src, Math.min(data.length, src + rowBytes)), (k * rows + r) * abpr); }
+		device.queue.writeBuffer(upStage.buf, at, tmp);
+	}
+	endPass();
+	getEncoder().copyBufferToTexture({ buffer: upStage.buf, offset: at, bytesPerRow: abpr, rowsPerImage: rows }, { texture: o.tex, mipLevel: mip, origin }, { width: w, height: h, depthOrArrayLayers: d });
+	usedInEncoder.add(o);
+	stagedUploads++;
+	return true;
+}
+
 function uploadBuffer(id, offset, size, dataOff, noOverwrite) {
 	const o = objs.get(id);
 	if (!o) return;
@@ -1275,7 +1383,12 @@ function uploadBuffer(id, offset, size, dataOff, noOverwrite) {
 	if (o.shadow) { o.shadow.set(u8.subarray(dataOff, dataOff + size), offset); o.version++; }
 	if (debugDraw && o.gpu && !o.shadow) { if (!o.dbg) o.dbg = new Uint8Array(o.size); o.dbg.set(u8.subarray(dataOff, dataOff + size), offset); }
 	if (o.gpu) {
-		if (!noOverwrite && usedInEncoder.has(o)) flush('buffer upload');		// a recorded draw still reads the old contents: D3D semantics need them (not after a no-overwrite map: the app promises those bytes are unused)
+		// a recorded draw still reads the old contents: D3D semantics need them (not after a no-overwrite map: the app promises those bytes are unused): a copy in order
+		if (!noOverwrite && usedInEncoder.has(o)) {
+			if (offset === 0 && size + 3 >= o.size && renamable(o)) renameBuffer(o);		// all of it replaced: a fresh buffer, written below
+			else if (stagedBufferUpload(o, offset, size, dataOff)) return;
+			else flush('buffer upload');
+		}
 		const n = size & ~3;
 		if (n) device.queue.writeBuffer(o.gpu, offset, u8, dataOff, n);
 		if (size & 3) {		// tail bytes: merge into a padded 4-byte write
@@ -1288,7 +1401,10 @@ function uploadBuffer(id, offset, size, dataOff, noOverwrite) {
 function uploadTexture(id, mip, slice, x, y, z, w, h, d, bytesPerRow, rowsPerImage, size, dataOff) {
 	const o = objs.get(id);
 	if (!o) return;
-	if (usedInEncoder.has(o)) flush('texture upload');
+	// a clear still waiting for this texture must happen before the new contents: recorded now, and the upload is then a copy recorded after it
+	const pend = pendingClears.length && pendingHas(id);
+	if (pend) flushPendingClears();
+	const inUse = pend || usedInEncoder.has(o);
 	markColorDirty(o);
 	if (debugDraw || debugPs) { o.uploads = (o.uploads || 0) + 1; o.lastUpload = 'mip' + mip + ' ' + w + 'x' + h + ' bpr' + bytesPerRow + ' first bytes ' + Array.from(u8.subarray(dataOff, dataOff + 8)).join(','); }		// dumpDraw only: a string per upload otherwise
 	const three = o.desc.dimension === '3d';
@@ -1306,6 +1422,10 @@ function uploadTexture(id, mip, slice, x, y, z, w, h, d, bytesPerRow, rowsPerIma
 			out[o4] = (v & 0x7ff) << 4; out[o4 + 1] = ((v >>> 11) & 0x7ff) << 4; out[o4 + 2] = ((v >>> 22) & 0x3ff) << 5; out[o4 + 3] = 0x3c00;
 		}
 		data = new Uint8Array(out.buffer); bpr = w * 8;
+	}
+	if (inUse) {		// earlier draws of this encoder read the old contents (see stagedTextureUpload)
+		if (stagedTextureUpload(o, mip, origin, data, bpr, rowsPerImage, w, h, d)) return;
+		flush('texture upload');
 	}
 	device.queue.writeTexture({ texture: o.tex, mipLevel: mip, origin }, data,
 		{ bytesPerRow: bpr, rowsPerImage }, { width: w, height: h, depthOrArrayLayers: d });
@@ -3611,7 +3731,7 @@ async function present(id) {
 			}
 		}
 		lastPresentT = tn;
-		ov.idle += fr.idle; ov.wait += fr.wait; ov.pipe += fr.pipe; ov.up += fr.up;		// the page's frame-rate overlay (below)
+		ov.idle += fr.idle; ov.wait += fr.wait; ov.pipe += fr.pipe; ov.up += fr.up; ov.upBytes += fr.upBytes;		// the page's frame-rate overlay (below)
 		chunkWin.idle += fr.idle; chunkWin.wait += fr.wait;
 		fr.idle = fr.pipe = fr.mod = fr.up = fr.upBytes = fr.wait = fr.flush = 0;
 	}
@@ -3655,7 +3775,7 @@ async function present(id) {
 		const tn = performance.now();
 		if (!fpsChannel) { fpsChannel = new BroadcastChannel('game-fps'); fpsChannel.onmessage = (e) => { if (e.data && e.data.overlay !== undefined) overlayOn = !!e.data.overlay; }; }
 		fpsOverlayN++;
-		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
+		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.upBytes = 0; ovReasons.clear(); for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
 		else if (tn - fpsOverlayT >= 500) {
 			const n = Math.max(1, fpsOverlayN), ms = (tn - fpsOverlayT) / n, busy = gpuBusyMs(tn), gpuPer = (busy - ov.gpu) / n;
 			const byEffect = new Map();
@@ -3666,10 +3786,13 @@ async function present(id) {
 				top, refl: ov.refl / n, reflSkip: ov.reflSkip / n, reflEvery: REFLECT_EVERY, merged: (clearsMerged - ov.merged) / n, reused: (packsReused - ov.reused) / n, noop: (noopDraws - ov.noop) / n,
 				culled: (chunkCulled - ov.culled) / n, chunk: CHUNK, chunkAuto: CHUNK_AUTO, chunkActive: chunkFrames > ov.chunkFrames, chip: overlayOn ? gpuTiming.result : null, overlay: overlayOn,
 				sizedPct: chunkSized + chunkUnsized - ov.sized > 0 ? Math.round(100 * (chunkSized - ov.sizedK) / (chunkSized + chunkUnsized - ov.sized)) : -1,
-				occl: OCCL, hidden: (occlCulled - ov.hidden) / n, occlOn: OCCL && occl.ready !== null && presentCount - occl.ready.frame <= OCCL_MAX_AGE,
+				occl: OCCL, hidden: (occlCulled - ov.hidden) / n, occlOn: OCCL && occlActive(), occlWhy: OCCL ? occlStatus() : '',
+				// what the GPU process got per frame: passes begun, submits and why, copies recorded instead of submits, bind groups made, MB uploaded
+				passes: (passesBegun - ov.passes) / n, submits: (submits - ov.submits) / n, why: [...ovReasons].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k, c]) => [k, c / n]),
+				staged: (stagedUploads + renamedBuffers - ov.staged) / n, bgs: (bgCreated - ov.bgs) / n, mb: ov.upBytes / n / 1048576,
 				// shader modules and pipelines made per second: each is compiled by Chrome's GPU process (shown there only as "GPU busy"), many while new places stream in
 				newShaders: (shaderModuleCount - ov.mods) * 1000 / (tn - fpsOverlayT), newPipelines: (pipeCreates + aheadMade - ov.pipes) * 1000 / (tn - fpsOverlayT) });
-			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled;
+			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.upBytes = 0; ovReasons.clear();
 			fpsOverlayN = 0; fpsOverlayT = tn; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = busy; ov.draws = drawCount;
 		}
 	}
@@ -3767,9 +3890,11 @@ async function runCommands(tail, head) {
 			const o = objs.get(u32[p]);
 			if (o) {
 				if (o.inBG) gEpoch++;		// a cached bind group may hold a view of it
-				if (usedInEncoder.has(o)) flush('destroy');
-				if (o.tex) { o.tex.destroy(); texBytesAlive -= o.bytes || 0; texCount--; }
-				if (o.gpu) { o.gpu.destroy(); bufBytesAlive -= o.bytes || 0; }
+				// used by commands of this encoder: destroyed right after its submit (a destroyed resource cannot be submitted; this used to submit at once, one submit per
+				// streamed-out object that was drawn this frame)
+				const later = usedInEncoder.has(o);
+				if (o.tex) { if (later) deferredDestroys.push(o.tex); else o.tex.destroy(); texBytesAlive -= o.bytes || 0; texCount--; }
+				if (o.gpu) { if (later) deferredDestroys.push(o.gpu); else o.gpu.destroy(); bufBytesAlive -= o.bytes || 0; }
 				objs.delete(u32[p]);
 			}
 			break;
