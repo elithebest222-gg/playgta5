@@ -152,7 +152,7 @@ function gpuTrack() {
 	device.queue.onSubmittedWorkDone().then(() => {
 		if (seq <= gpuDoneSeq) return;
 		gpuDoneSeq = seq;
-		if (seq === gpuSeq) ov.gpu += performance.now() - gpuBusyT0;		// nothing newer outstanding: idle from now
+		if (seq === gpuSeq) { const d = performance.now() - gpuBusyT0; ov.gpu += d; chunkWin.gpu += d; }		// nothing newer outstanding: idle from now
 	});
 }
 let encoder = null, pass = null, passKey = '';
@@ -796,6 +796,23 @@ const CHUNK = (() => {
 })();
 const chunkCam = { frame: -1, x: 0, y: 0, cx: 0, cy: 0 };
 let chunkCulled = 0;
+// Chunks that follow the frame rate (?chunkauto=<target frame time in ms>, the page's presets: 33 ms on Balanced): once a second the three distances are scaled together, down
+// (x0.85, to 0.4 of the preset's at least) while the frames take longer than the target and draws set their length (the graphics side or the translation busy most of the
+// frame), back up (x1.08, to twice the preset's at most) while there is room or the game's own threads are what holds the frame rate (fewer draws would not help then).
+const CHUNK_AUTO = isNode ? 0 : Math.max(0, +(new URLSearchParams(self.location.search).get('chunkauto') || 0));
+const CHUNK_BASE = { cell: CHUNK.cell, people: CHUNK.people, details: CHUNK.details }, CHUNK_MIN_SCALE = 0.4, CHUNK_MAX_SCALE = 2;
+let chunkScale = 1;
+const chunkWin = { t: 0, n: 0, idle: 0, wait: 0, gpu: 0 };		// this second's frames (present)
+function chunkAdaptStep(scale, ms, gpu, work, target) {
+	const drawBound = gpu >= 0.7 * ms || work >= 0.7 * ms;
+	if (ms > target * 1.08 && drawBound) return Math.max(CHUNK_MIN_SCALE, scale * 0.85);
+	if (ms < target * 0.85 || !drawBound) return Math.min(CHUNK_MAX_SCALE, scale * 1.08);
+	return scale;
+}
+function chunkApplyScale(scale) {
+	chunkScale = scale;
+	CHUNK.cell = Math.max(1, Math.round(CHUNK_BASE.cell * scale)); CHUNK.people = Math.round(CHUNK_BASE.people * scale); CHUNK.details = Math.round(CHUNK_BASE.details * scale);
+}
 // 0: never culled, 1: the world's solid objects (buildings, props, trees), 2: people and vehicles, 3: decals
 function chunkKind(label) {
 	const k = label.indexOf('::'), e = (k > 0 ? label.slice(0, k) : label).toLowerCase();
@@ -810,7 +827,8 @@ function chunkCull(vsProg, psProg, inst) {
 	if (inst > 1) return false;
 	let mrt = 0;
 	for (let i = 0; i < 8; i++) if (S.rt[i].tex) mrt++;
-	if (mrt < 3) return false;
+	if (!mrt) return false;		// depth-only passes (occlusion, shadows): never
+	if (mrt < 3 && chunkCam.frame !== presentCount) return false;		// passes with fewer targets (glass, foliage, decals drawn see-through) only after the G-buffer gave the frame's camera
 	const prog = psProg || vsProg;
 	const kind = prog.chunkKind !== undefined ? prog.chunkKind : (prog.chunkKind = chunkKind(prog.label || ''));
 	if (!kind) return false;
@@ -827,7 +845,7 @@ function chunkCull(vsProg, psProg, inst) {
 	else if (f[v + 12] === 0 && f[v + 13] === 0 && f[v + 14] === 0 && f[v + 15] === 1) { cx = f[v + 3]; cy = f[v + 7]; }
 	else return false;
 	if (!(Math.abs(x) < 1e5 && Math.abs(y) < 1e5 && Math.abs(cx) < 1e5 && Math.abs(cy) < 1e5)) return false;		// not a position on the map
-	if (chunkCam.frame !== presentCount) { chunkCam.frame = presentCount; chunkCam.x = cx; chunkCam.y = cy; chunkCam.cx = Math.floor(cx / CHUNK.cell); chunkCam.cy = Math.floor(cy / CHUNK.cell); }
+	if (chunkCam.frame !== presentCount) { if (mrt < 3) return false; chunkCam.frame = presentCount; chunkCam.x = cx; chunkCam.y = cy; chunkCam.cx = Math.floor(cx / CHUNK.cell); chunkCam.cy = Math.floor(cy / CHUNK.cell); }
 	else if (Math.abs(cx - chunkCam.x) > 0.05 || Math.abs(cy - chunkCam.y) > 0.05) return false;		// not the frame's main view
 	const dx = x - cx, dy = y - cy, d2 = dx * dx + dy * dy;
 	if (kind === 2 && CHUNK.people > 0 && d2 > CHUNK.people * CHUNK.people) return true;
@@ -3217,6 +3235,7 @@ async function present(id) {
 		}
 		lastPresentT = tn;
 		ov.idle += fr.idle; ov.wait += fr.wait; ov.pipe += fr.pipe; ov.up += fr.up;		// the page's frame-rate overlay (below)
+		chunkWin.idle += fr.idle; chunkWin.wait += fr.wait;
 		fr.idle = fr.pipe = fr.mod = fr.up = fr.upBytes = fr.wait = fr.flush = 0;
 	}
 	{	// every 10 s: frame rate and work per frame (visible in the session log)
@@ -3245,6 +3264,15 @@ async function present(id) {
 			dbgChannel.postMessage({ limit: Atomics.load(i32, dbgIdx), total: Atomics.load(i32, dbgIdx + 1), last: dbgLastLabel });
 		}
 	}
+	if (CHUNK_AUTO > 0 && CHUNK_BASE.cell > 0) {		// chunks that follow the frame rate (CHUNK_AUTO)
+		const tn = performance.now();
+		if (!chunkWin.t) { chunkWin.t = tn; chunkWin.n = 0; chunkWin.idle = chunkWin.wait = chunkWin.gpu = 0; }
+		else if (++chunkWin.n && tn - chunkWin.t >= 1000) {
+			const n = chunkWin.n, ms = (tn - chunkWin.t) / n, gpu = Math.min(ms, chunkWin.gpu / n), work = Math.max(0, ms - (chunkWin.idle + chunkWin.wait) / n);
+			chunkApplyScale(chunkAdaptStep(chunkScale, ms, gpu, work, CHUNK_AUTO));
+			chunkWin.t = tn; chunkWin.n = 0; chunkWin.idle = chunkWin.wait = chunkWin.gpu = 0;
+		}
+	}
 	if (!isNode) {		// the page's FPS counter (index.html, '=' key): presented frames per second, twice a second, and where a frame's time went (per frame): this worker waiting
 		// for the game's commands (idle), waiting for the GPU (wait: a frame slot or a fence), working (the rest: translating draws), and how long the GPU had work (gpu, see gpuTrack)
 		const tn = performance.now();
@@ -3260,7 +3288,7 @@ async function present(id) {
 			const top = [...byEffect].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([e, c]) => [e, c / n]);
 			fpsChannel.postMessage({ fps: fpsOverlayN * 1000 / (tn - fpsOverlayT), ms, draws: (drawCount - ov.draws) / n, idle: ov.idle / n, wait: ov.wait / n, pipe: ov.pipe / n, up: ov.up / n, gpu: Math.min(ms, ov.gpu / n),
 				top, refl: ov.refl / n, reflSkip: ov.reflSkip / n, reflEvery: REFLECT_EVERY, merged: (clearsMerged - ov.merged) / n, reused: (packsReused - ov.reused) / n, noop: (noopDraws - ov.noop) / n,
-				culled: (chunkCulled - ov.culled) / n, chunk: CHUNK });
+				culled: (chunkCulled - ov.culled) / n, chunk: CHUNK, chunkAuto: CHUNK_AUTO });
 			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled;
 			fpsOverlayN = 0; fpsOverlayT = tn; ov.idle = ov.wait = ov.pipe = ov.up = ov.gpu = ov.refl = ov.reflSkip = 0; ov.draws = drawCount;
 		}
