@@ -141,7 +141,7 @@ let noF32Filter = false, noD32S8 = false, noRG11 = false;
 let mem = null, memBuffer = null, i32 = null, u32 = null, f32 = null, u8 = null, ringBase = 0, ringSize = 0;
 let canvas = null, canvasCtx = null, canvasFormat = null, blit = null, canvasConfigured = false;
 let fpsChannel = null, fpsOverlayN = 0, fpsOverlayT = 0;
-const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0 };		// the frame-rate overlay's sums since its last report (present)
+const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0, merged: 0, reused: 0, noop: 0 };		// merged/reused/noop: the counters' values at the last report		// the frame-rate overlay's sums since its last report (present)
 const ovProgs = [];		// the programs drawn since the overlay's last report, each with its count in `ovN` (summed per effect for the report)
 // The GPU's share of a frame (the overlay's "GPU"): the time during which some submitted work is not finished yet, from the submit to the moment this worker learns that the
 // newest submit is done (its event loop gets a turn at least every 2 ms). It includes the GPU process's own work on the commands, so it is a little long, never short.
@@ -159,7 +159,7 @@ let encoder = null, pass = null, passKey = '';
 let errorCount = 0, errorCount0 = 0, clampedDraws = 0, clampedDraws0 = 0, gpuErrorChannel = null;
 const errorKinds = new Map();		// normalised message -> { n, msg }
 function dumpErrors() { for (const [k, e] of [...errorKinds].sort((a, b) => b[1].n - a[1].n).slice(0, 15)) logLine('  error x' + e.n + ': ' + e.msg.slice(0, 300)); }
-let drawCount = 0, skippedDraws = 0;
+let drawCount = 0, skippedDraws = 0, noopDraws = 0;
 let lastPresentDraws = 0, progressChannel = null, worldSent = false;
 let lastFitVs = null, lastFitPs = null;		// the shader pair of the last draw that needed texture-limit variants (fitTextures): a change forces a pipeline lookup
 let worldSince = 0, worldClean = 0, worldSkips0 = 0, worldNoteT = 0, skipsAtPresent = 0;		// present(): the title screen stays up until frames stop skipping draws
@@ -1034,6 +1034,15 @@ function packCopy(prog, stage) {
 		for (let i = 0; i < n; i++) if (en.objs[i] !== curObjs[i] || en.vers[i] !== curVers[i] || en.firsts[i] !== curFirsts[i]) { same = false; break; }
 		if (same) return en.alloc;
 	}
+	// The engine uploads the same constants again all the time (a material's parameters, set anew for the next draw of the same material): when the bytes equal the last pack
+	// of this program and stage in this frame, that allocation is used again. The bind group then keeps its dynamic offset and is not set again, and every set made Chrome's
+	// GPU process walk all the textures of the group once more.
+	const last = list.length ? list[list.length - 1] : null;
+	if (last && last.frame === ubo.frame && samePack(members, n, last.alloc)) {
+		for (let i = 0; i < n; i++) { last.objs[i] = curObjs[i]; last.vers[i] = curVers[i]; last.firsts[i] = curFirsts[i]; }
+		packsReused++;
+		return last.alloc;
+	}
 	// members are contiguous (packUniforms): each is copied straight into the ring mirror, and only the part a constant buffer does not cover is zeroed (D3D reads zeros there)
 	const aOff = uniformAlloc(pack.size), aChunk = allocChunk;
 	const dst = stageReserve(aChunk, aOff, pack.size);
@@ -1066,6 +1075,33 @@ function packCopy(prog, stage) {
 	return en.alloc;
 }
 ubo.frame = 0;
+let packsReused = 0;
+// would packing the bound constant buffers now (curObjs/curFirsts, see packCopy) give the same bytes as the pack at `alloc`? Compared 32 bits at a time (offsets are multiples of 16).
+function samePack(members, n, alloc) {
+	const st = alloc.chunk.stage;
+	if (!st) return false;
+	const d32 = alloc.chunk.stage32 && alloc.chunk.stage32.buffer === st.buffer ? alloc.chunk.stage32 : (alloc.chunk.stage32 = new Int32Array(st.buffer, st.byteOffset, st.length >> 2));
+	for (let i = 0; i < n; i++) {
+		const m = members[i], o = curObjs[i], at = (alloc.off + m.offset) >> 2;
+		let len = 0;
+		if (o && o.shadow) {
+			const from = curFirsts[i] * 16;
+			len = Math.min(m.size, o.size - from);
+			if (len > 0) {
+				const s32 = o.shadow32 || (o.shadow32 = new Int32Array(o.shadow.buffer, o.shadow.byteOffset, o.shadow.length >> 2));
+				const w = len >> 2, f = from >> 2;
+				for (let k = 0; k < w; k++) if (s32[f + k] !== d32[at + k]) return false;
+				for (let k = w << 2; k < len; k++) if (o.shadow[from + k] !== st[alloc.off + m.offset + k]) return false;
+			} else len = 0;
+		}
+		let k = alloc.off + m.offset + len;		// the zeroed rest
+		const e = alloc.off + m.offset + m.size;
+		for (; (k & 3) && k < e; k++) if (st[k] !== 0) return false;
+		for (; k + 4 <= e; k += 4) if (d32[k >> 2] !== 0) return false;
+		for (; k < e; k++) if (st[k] !== 0) return false;
+	}
+	return true;
+}
 
 // ---- dummies for unbound slots ------------------------------------------------------------------------------------------------------------
 const dummy = { tex: new Map(), smp: null, cmp: null, buf: null, uni: null };
@@ -1642,7 +1678,10 @@ function compileAhead(rc, key) {
 function aheadStep() {
 	if (aheadPos >= aheadList.length && !aheadLater.length) return;
 	const t0 = performance.now();
-	while (aheadInFlight < AHEAD_MAX && performance.now() - t0 < 3) {
+	// once the world is shown, one compile at a time: each runs on a thread of Chrome's GPU process, and on a 4-thread CPU three at once took cores the game and the GPU
+	// process itself need right then (a story mission loading its people and places)
+	const inFlightMax = worldSent ? 1 : AHEAD_MAX;
+	while (aheadInFlight < inFlightMax && performance.now() - t0 < 3) {
 		if (aheadPos >= aheadList.length) {
 			if (!aheadLater.length || aheadReadyAtPass === shadersReady) break;
 			aheadReadyAtPass = shadersReady; aheadList = aheadLater; aheadLater = []; aheadPos = 0;
@@ -1664,8 +1703,11 @@ function recordRecipe(rc, key) {
 function idbOpen() {
 	return new Promise((res, rej) => { const r = indexedDB.open('gta-pipelines', 1); r.onupgradeneeded = () => r.result.createObjectStore('recipes'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
 }
+// this browser's recipes, one list per kind of settings: the low ones (Balanced, Fast, Fastest: ?low=1) apart from the rest, so a session does not compile ahead thousands of
+// pipelines recorded with other settings (shadows and all) that it never draws
+const RECIPES_KEY = !isNode && new URLSearchParams(self.location.search).get('low') === '1' ? 'list-low' : 'list';
 async function idbList(db) {
-	return new Promise((res) => { const r = db.transaction('recipes').objectStore('recipes').get('list'); r.onsuccess = () => res(Array.isArray(r.result) ? r.result : []); r.onerror = () => res([]); });
+	return new Promise((res) => { const r = db.transaction('recipes').objectStore('recipes').get(RECIPES_KEY); r.onsuccess = () => res(Array.isArray(r.result) ? r.result : []); r.onerror = () => res([]); });
 }
 async function loadRecipes() {
 	let local = [], seed = [];
@@ -1692,7 +1734,7 @@ async function saveRecipes() {
 		const db = await idbOpen();
 		const list = (await idbList(db)).concat(add);
 		if (list.length > RECIPES_MAX) list.splice(0, list.length - RECIPES_MAX);
-		await new Promise((res, rej) => { const t = db.transaction('recipes', 'readwrite'); t.objectStore('recipes').put(list, 'list'); t.oncomplete = res; t.onerror = () => rej(t.error); });
+		await new Promise((res, rej) => { const t = db.transaction('recipes', 'readwrite'); t.objectStore('recipes').put(list, RECIPES_KEY); t.oncomplete = res; t.onerror = () => rej(t.error); });
 		recipesSaved = list.length;
 	} catch (e) { logOnce('idbsave', 'pipeline recipes not saved: ' + (e && e.message)); }
 }
@@ -1710,7 +1752,9 @@ function ensurePass() {
 		const t = r.tex ? objs.get(r.tex) : null;
 		if (!t) { colorAttachments.push(null); rtInfo.push(null); continue; }
 		const v = targetView(t, r.fmt, r.mip, r.slice);
-		colorAttachments.push({ view: v.view, loadOp: 'load', storeOp: 'store' });
+		const att = { view: v.view, loadOp: 'load', storeOp: 'store' };
+		if (pendingClears.length) takeColorClear(att, r.tex, r.mip, r.slice, v.format, t);
+		colorAttachments.push(att);
 		markColorDirty(t);
 		rtInfo.push({ format: v.format });
 		samples = t.desc.sampleCount; any = true; passW = Math.max(1, t.desc.size.width >> r.mip); passH = Math.max(1, t.desc.size.height >> r.mip);
@@ -1727,12 +1771,19 @@ function ensurePass() {
 		const roDepth = (S.ds.flags & 1) !== 0, roStencil = (S.ds.flags & 2) !== 0;
 		if (roDepth) att.depthReadOnly = true; else { att.depthLoadOp = 'load'; att.depthStoreOp = 'store'; }
 		if (hasStencil(dt.format)) { if (roStencil) att.stencilReadOnly = true; else { att.stencilLoadOp = 'load'; att.stencilStoreOp = 'store'; } }
+		if (pendingClears.length) takeDepthClear(att, S.ds.tex, S.ds.mip, S.ds.slice, dt, roDepth, roStencil);
 		if (!roDepth && !roStencil) markDepthDirty(dt);
 		desc.depthStencilAttachment = att; dsFormat = dt.format; samples = dt.desc.sampleCount; any = true;
 		if (!S.rt.some((r) => r.tex)) { passW = Math.max(1, dt.desc.size.width >> S.ds.mip); passH = Math.max(1, dt.desc.size.height >> S.ds.mip); }
 		usedInEncoder.add(dt);
 	}
 	if (!any) return false;
+	// a clear still waiting for a texture this pass renders into (another view of it, or one that could not be folded in) must happen before the pass does
+	if (pendingClears.length) {
+		let conflict = !!dt && pendingHas(S.ds.tex);
+		for (let i = 0; i < 8 && !conflict; i++) if (S.rt[i].tex && pendingHas(S.rt[i].tex)) conflict = true;
+		if (conflict) flushPendingClears();
+	}
 	rtInfo.samples = samples;
 	passKey = key;
 	pdirty = true;
@@ -2013,6 +2064,10 @@ function doDraw(p) {
 		dbgFrameDraw++;
 	}
 	const kind = u32[p], count = u32[p + 1], inst = u32[p + 2], start = u32[p + 3], baseVertex = u32[p + 4] | 0, startInstance = u32[p + 5];
+	// draws that cannot touch a pixel (D3D accepts them): no vertices or instances, an empty scissor rectangle, an empty viewport. Each still cost a full draw here and in the GPU process.
+	if (kind < 4 && (count === 0 || inst === 0)) { noopDraws++; return; }
+	if (S.viewports.length && (S.viewports[0][2] <= 0 || S.viewports[0][3] <= 0)) { noopDraws++; return; }
+	if (S.scissors.length && S.rs) { const rs0 = objs.get(S.rs), c = S.scissors[0]; if (rs0 && rs0.words[7] && (c[2] <= c[0] || c[3] <= c[1])) { noopDraws++; return; } }
 	// a draw into a reflection (REFLECT_EVERY): skipped while that face keeps its picture from an earlier frame
 	const r0 = S.rt[0], t0 = r0.tex ? objs.get(r0.tex) : null;
 	if (t0 && t0.reflect) {
@@ -2035,6 +2090,7 @@ function doDraw(p) {
 		if (lastFitVs !== vsObj || lastFitPs !== psObj) { lastFitVs = vsObj; lastFitPs = psObj; pdirty = true; }
 	} else if (lastFitVs) { lastFitVs = lastFitPs = null; pdirty = true; }
 	if (REFLECT_EVERY > 1 && psProg && t0 && !t0.reflectNot && t0.reflect !== undefined) waterReflection(t0, r0.slice, psProg);
+	if (pendingClears.length && (drawReadsPending(vsProg, 0) || drawReadsPending(psProg, 1))) flushPendingClears();
 	prepareDepthProxies(vsProg, 0);
 	if (psProg) prepareDepthProxies(psProg, 1);
 	if (!ensurePass()) { skipDraw('if (!ensurePass()) { skippedDraws++; return; }'); return; }
@@ -2731,8 +2787,7 @@ function clearRT(id, mip, slice, r, g, b, a) {
 	if (t.reflect && !reflectDue(t, slice)) return;		// a reflection face kept from an earlier frame (REFLECT_EVERY)
 	markColorDirty(t);
 	endPass();
-	const view = clearView(t, mip, slice);
-	getEncoder().beginRenderPass({ colorAttachments: [{ view, loadOp: 'clear', storeOp: 'store', clearValue: { r, g, b, a } }] }).end();
+	queueClear({ t, id, mip, slice, depth: false, color: { r, g, b, a }, flags: 0, depthValue: 0, stencil: 0 });
 }
 
 function clearDS(id, mip, slice, flags, depth, stencil) {
@@ -2740,11 +2795,91 @@ function clearDS(id, mip, slice, flags, depth, stencil) {
 	if (!t || t.kind !== 'texture') return;
 	markDepthDirty(t);
 	endPass();
-	const view = clearView(t, mip, slice);
-	const att = { view, depthLoadOp: (flags & 1) ? 'clear' : 'load', depthStoreOp: 'store', depthClearValue: depth };
-	if (hasStencil(t.format)) Object.assign(att, { stencilLoadOp: (flags & 2) ? 'clear' : 'load', stencilStoreOp: 'store', stencilClearValue: stencil });
-	getEncoder().beginRenderPass({ colorAttachments: [], depthStencilAttachment: att }).end();
+	queueClear({ t, id, mip, slice, depth: true, color: null, flags, depthValue: depth, stencil });
 }
+
+// ---- clears folded into the next pass --------------------------------------------------------------------------------------------------------------------
+// A D3D clear was a render pass of its own (begin, clear, end), and the game clears its targets right before it draws into them: in Chrome's GPU process and the driver a pass
+// that only clears costs about as much set-up as one that draws. A clear now waits (pendingClears) and becomes the load operation of the next pass that renders into that very
+// view, which then starts cleared. Before anything else that may read or write a waiting clear's texture the waiting clears run as before (flushPendingClears): any command
+// but state changes, creations, draws and clears (CLEAR_SAFE); a texture upload to it; a draw that samples it (drawReadsPending); a pass that has its texture attached
+// in a way the clear cannot become part of (another view format, a read-only depth). ?mergeclears=0 turns it off (diagnostics).
+const MERGE_CLEARS = isNode ? process.env.WGPU_MERGE_CLEARS !== '0' : new URLSearchParams(self.location.search).get('mergeclears') !== '0';
+const pendingClears = [];
+let clearsMerged = 0, clearsRun = 0;
+function queueClear(c) {
+	if (!MERGE_CLEARS || c.t.desc.dimension === '3d') { runClear(c); return; }
+	for (const e of pendingClears) {
+		if (e.id !== c.id || e.mip !== c.mip || e.slice !== c.slice || e.depth !== c.depth) continue;
+		if (!c.depth) e.color = c.color;		// a later clear of the same view replaces the earlier one
+		else { if (c.flags & 1) { e.flags |= 1; e.depthValue = c.depthValue; } if (c.flags & 2) { e.flags |= 2; e.stencil = c.stencil; } }
+		return;
+	}
+	pendingClears.push(c);
+}
+function runClear(c) {		// the clear as its own pass
+	const t = c.t;
+	if (objs.get(c.id) !== t) return;		// destroyed meanwhile
+	clearsRun++;
+	const view = clearView(t, c.mip, c.slice);
+	if (!c.depth) getEncoder().beginRenderPass({ colorAttachments: [{ view, loadOp: 'clear', storeOp: 'store', clearValue: c.color }] }).end();
+	else {
+		const att = { view, depthLoadOp: (c.flags & 1) ? 'clear' : 'load', depthStoreOp: 'store', depthClearValue: c.depthValue };
+		if (hasStencil(t.format)) Object.assign(att, { stencilLoadOp: (c.flags & 2) ? 'clear' : 'load', stencilStoreOp: 'store', stencilClearValue: c.stencil });
+		getEncoder().beginRenderPass({ colorAttachments: [], depthStencilAttachment: att }).end();
+	}
+	usedInEncoder.add(t);
+}
+function flushPendingClears() {
+	if (!pendingClears.length) return;
+	endPass();
+	const list = pendingClears.splice(0);
+	for (const c of list) runClear(c);
+}
+function pendingHas(id) { for (let i = 0; i < pendingClears.length; i++) if (pendingClears[i].id === id) return true; return false; }
+function dropPendingClears(id) { for (let i = pendingClears.length - 1; i >= 0; i--) if (pendingClears[i].id === id) pendingClears.splice(i, 1); }
+// does this draw read (or write as a UAV) a texture with a waiting clear?
+function drawReadsPending(prog, stage) {
+	if (!prog) return false;
+	const bs = prog.info.bindings;
+	for (let i = 0; i < bs.length; i++) {
+		const b = bs[i];
+		let id = 0;
+		if (b.kind === 'texture' || ((b.kind === 'read-only-storage' || b.kind === 'storage') && b.binding < 160)) id = S.srv[stage][b.binding - 32];
+		else if (b.kind === 'storage-texture' || b.binding >= 160) id = S.uav[stage] ? S.uav[stage][b.binding - (b.binding >= 176 ? 176 : 160)] : 0;
+		const v = id ? objs.get(id) : null;
+		if (v && !v.isBuf && pendingHas(v.res)) return true;
+	}
+	return false;
+}
+// a waiting clear of this view, as the attachment's load operation (true), or none (false); a clear that cannot be folded in stays waiting (see ensurePass)
+function takeColorClear(att, id, mip, slice, format, t) {
+	for (let i = 0; i < pendingClears.length; i++) {
+		const c = pendingClears[i];
+		if (c.depth || c.id !== id || c.mip !== mip || c.slice !== slice) continue;
+		if (format !== viewFormat(0, t)) return false;		// the clear was of the texture's own format; this view reads it differently
+		att.loadOp = 'clear'; att.clearValue = c.color;
+		pendingClears.splice(i, 1); clearsMerged++;
+		return true;
+	}
+	return false;
+}
+function takeDepthClear(att, id, mip, slice, t, roDepth, roStencil) {
+	for (let i = 0; i < pendingClears.length; i++) {
+		const c = pendingClears[i];
+		if (!c.depth || c.id !== id || c.mip !== mip || c.slice !== slice) continue;
+		const st = hasStencil(t.format);
+		if (((c.flags & 1) && roDepth) || ((c.flags & 2) && st && roStencil)) return false;		// a read-only aspect cannot be cleared by the pass
+		if (c.flags & 1) { att.depthLoadOp = 'clear'; att.depthClearValue = c.depthValue; }
+		if ((c.flags & 2) && st) { att.stencilLoadOp = 'clear'; att.stencilClearValue = c.stencil; }
+		pendingClears.splice(i, 1); clearsMerged++;
+		return true;
+	}
+	return false;
+}
+// commands that neither read nor write texture contents outside a pass: a waiting clear can stay waiting across them (UPLOAD_TEXTURE and DESTROY_OBJECT: see runCommands)
+const CLEAR_SAFE = new Uint8Array(64);
+for (const op of [0, 2, 3, 4, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 37, 38, 44, 47, 5, 6]) CLEAR_SAFE[op] = 1;
 
 // Present: in a browser, blit the back buffer into the canvas; in Node there is no surface (screenshots are explicit).
 function makeBlit() {
@@ -3060,7 +3195,7 @@ async function present(id) {
 		// for the game's commands (idle), waiting for the GPU (wait: a frame slot or a fence), working (the rest: translating draws), and how long the GPU had work (gpu, see gpuTrack)
 		const tn = performance.now();
 		fpsOverlayN++;
-		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.gpu = ov.refl = ov.reflSkip = 0; ov.draws = drawCount; for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
+		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.gpu = ov.refl = ov.reflSkip = 0; ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
 		else if (tn - fpsOverlayT >= 500) {
 			if (!fpsChannel) fpsChannel = new BroadcastChannel('game-fps');
 			if (gpuDoneSeq < gpuSeq) { ov.gpu += tn - gpuBusyT0; gpuBusyT0 = tn; }		// the GPU is still busy: its time so far counts now
@@ -3070,7 +3205,8 @@ async function present(id) {
 			ovProgs.length = 0;
 			const top = [...byEffect].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([e, c]) => [e, c / n]);
 			fpsChannel.postMessage({ fps: fpsOverlayN * 1000 / (tn - fpsOverlayT), ms, draws: (drawCount - ov.draws) / n, idle: ov.idle / n, wait: ov.wait / n, pipe: ov.pipe / n, up: ov.up / n, gpu: Math.min(ms, ov.gpu / n),
-				top, refl: ov.refl / n, reflSkip: ov.reflSkip / n, reflEvery: REFLECT_EVERY });
+				top, refl: ov.refl / n, reflSkip: ov.reflSkip / n, reflEvery: REFLECT_EVERY, merged: (clearsMerged - ov.merged) / n, reused: (packsReused - ov.reused) / n, noop: (noopDraws - ov.noop) / n });
+			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws;
 			fpsOverlayN = 0; fpsOverlayT = tn; ov.idle = ov.wait = ov.pipe = ov.up = ov.gpu = ov.refl = ov.reflSkip = 0; ov.draws = drawCount;
 		}
 	}
@@ -3149,6 +3285,11 @@ async function runCommands(tail, head) {
 		const op = u32[base], n = u32[base + 1];
 		if (op === OP.WRAP) { tail = RING_DATA; continue; }
 		const p = base + 2;
+		if (pendingClears.length) {		// see CLEAR_SAFE
+			if (op >= 64 || !CLEAR_SAFE[op]) flushPendingClears();
+			else if (op === 13 /* UPLOAD_TEXTURE */ && pendingHas(u32[p])) flushPendingClears();
+			else if (op === 4 /* DESTROY_OBJECT */) dropPendingClears(u32[p]);
+		}
 		switch (op) {		// numeric labels (OP.* in comments): V8 compiles constant Smi cases to a jump table; `case OP.X` was a chain of property loads and compares per command
 		case 0 /* NOP */: case 2 /* INIT */: break;
 		case 3 /* CREATE_TEXTURE */: createTexture(u32[p], u32[p + 1], u32[p + 2], u32[p + 3], u32[p + 4], u32[p + 5], u32[p + 6], u32[p + 7], u32[p + 8], u32[p + 9]); break;

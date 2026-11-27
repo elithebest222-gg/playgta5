@@ -454,11 +454,13 @@ function fpsDetail(d) {
 	// "GPU busy" is the time from a submit until the work is done: Chrome's GPU process handling every draw (a CPU cost per draw) and the graphics chip's own work
 	const slowest = gpu >= 0.85 * d.ms ? 'the graphics side (Chrome\'s GPU process and the chip: fewer draws or pixels help)' : work >= 0.8 * d.ms ? 'translating draws (CPU)' : 'the game\'s threads (CPU)';
 	const extra = [d.pipe >= 1 && 'compiling shaders ' + ms(d.pipe), d.up >= 1 && 'uploads ' + ms(d.up)].filter(Boolean).join(' · ');
+	// what the per-draw savings did this frame: clears that became part of the next pass, constant uploads that matched the last ones, draws that could not touch a pixel
+	const saved = [d.merged >= 1 && Math.round(d.merged) + ' clears folded', d.reused >= 1 && Math.round(d.reused) + ' constants reused', d.noop >= 1 && Math.round(d.noop) + ' empty draws skipped'].filter(Boolean).join(' · ');
 	// what the draws are (the shader effect: ped, vehicle_*, trees*, normal*... = buildings and props, im = blits and UI, ...) and the reflection cube map's share
 	const top = (d.top || []).filter((x) => x[1] >= 1).map((x) => x[0] + ' ' + Math.round(x[1])).join(' · ');
 	const refl = (d.refl || 0) + (d.reflSkip || 0) >= 1 ? 'reflections ' + Math.round(d.refl || 0) + ' drawn' + (d.reflSkip >= 1 ? ', ' + Math.round(d.reflSkip) + ' skipped (each face every ' + d.reflEvery + ' frames)' : '') : '';
 	return ms(d.ms) + ' a frame · ' + Math.round(d.draws) + ' draws\nGPU busy ' + ms(gpu) + ' · translating ' + ms(work) + ' · waiting for the game ' + ms(d.idle) + (d.wait >= 0.5 ? ' · waiting for the GPU ' + ms(d.wait) : '') + (extra ? '\n' + extra : '') +
-		(top ? '\nmost drawn: ' + top : '') + (refl ? '\n' + refl : '') + '\nslowest: ' + slowest;
+		(top ? '\nmost drawn: ' + top : '') + (refl ? '\n' + refl : '') + (saved ? '\nsaved: ' + saved : '') + '\nslowest: ' + slowest;
 }
 // FPS counter, top left: off by default, the = key toggles it. The GPU worker counts presented frames and posts the rate twice a second on 'game-fps'. The key does not reach
 // the game (capture phase on window, before the input handlers; this build has debug key bindings).
