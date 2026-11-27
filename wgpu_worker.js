@@ -848,6 +848,17 @@ const CHUNK = (() => {
 	const v = (isNode ? process.env.WGPU_CHUNK || '' : new URLSearchParams(self.location.search).get('chunk') || '').split(',').map((x) => Math.max(0, +x || 0));
 	return { cell: v[0] || 0, people: v[1] || 0, details: v[2] || 0, lodTrees: v[3] || 0, trees: v[4] || 0, glass: v[5] || 0 };
 })();
+// A draw is judged by its object's origin, and large objects reach far from theirs: road pieces and building blocks can be over 100 m long. With cells of a few dozen metres
+// (Fastest went down to 26 m) the road under the car was left out whenever its origin lay two cells away (reported: "roads don't load in"). Cells never get smaller than this,
+// so whatever is drawn starts at least 120 m from the camera; trees, which are small, may have a shorter distance of their own, not below CHUNK_MIN_TREES.
+const CHUNK_MIN_CELL = 120, CHUNK_MIN_TREES = 100, CHUNK_MIN_LOD_TREES = 150;
+// people/vehicles (kind 2), decals (3) and glass (6) have no distances of their own any more (kept in ?chunk for the order of the values): see chunkCull
+function chunkFloors() {
+	if (CHUNK.cell > 0) CHUNK.cell = Math.max(CHUNK_MIN_CELL, CHUNK.cell);
+	if (CHUNK.trees > 0) CHUNK.trees = Math.max(CHUNK_MIN_TREES, CHUNK.trees);
+	if (CHUNK.lodTrees > 0) CHUNK.lodTrees = Math.max(CHUNK_MIN_LOD_TREES, CHUNK.lodTrees);
+}
+chunkFloors();
 const chunkCam = { frame: -1, x: 0, y: 0, cx: 0, cy: 0 };
 let chunkCulled = 0;
 // Chunks that follow the frame rate (?chunkauto=<target frame time in ms>, the page's presets: 33 ms on Balanced): once a second the three distances are scaled together, down
@@ -856,6 +867,7 @@ let chunkCulled = 0;
 // (A rule that only shrank when one part was busy 70 % of the frame never fired on a 4-thread CPU, where the game's threads, this worker and the GPU process share the cores.)
 const CHUNK_AUTO = isNode ? 0 : Math.max(0, +(new URLSearchParams(self.location.search).get('chunkauto') || 0));
 const CHUNK_BASE = { ...CHUNK }, CHUNK_MIN_SCALE = 0.4, CHUNK_MAX_SCALE = 2;
+
 let chunkScale = 1;
 const chunkWin = { t: 0, n: 0, idle: 0, wait: 0, gpu: 0 };		// this second's frames (present)
 function chunkAdaptStep(scale, ms, gpu, idle, target) {
@@ -867,7 +879,7 @@ function chunkAdaptStep(scale, ms, gpu, idle, target) {
 function chunkApplyScale(scale) {
 	chunkScale = scale;
 	for (const k in CHUNK_BASE) CHUNK[k] = Math.round(CHUNK_BASE[k] * scale);
-	CHUNK.cell = Math.max(1, CHUNK.cell);
+	chunkFloors();
 }
 // 0: never culled, 1: the world's solid objects (buildings, props), 2: people and vehicles, 3: decals, 4: the stand-ins of distant trees (trees_lod*: a recording on
 // an N100 Chromebook had ~100 of them a frame on a road through hills, more than any other kind), 5: trees (alpha-tested leaves: costly on small GPUs), 6: see-through
@@ -913,7 +925,11 @@ function chunkCull(vsProg, psProg, inst) {
 	if (mrt < 3 && chunkCam.frame !== presentCount) return false;		// passes with fewer targets (glass, foliage, decals drawn see-through) only after the G-buffer gave the frame's camera
 	const prog = psProg || vsProg;
 	const kind = prog.chunkKind !== undefined ? prog.chunkKind : (prog.chunkKind = chunkKind(prog.label || ''));
-	if (!kind) return false;
+	if (!kind || kind === 2) return false;		// people and vehicles: never (see below)
+	// Skinned meshes (vehicles' bodies, people, breakable props: lamp posts, signs, fences; VS_*Skin*) are placed by their bone matrices, and the object matrix at b1 is not
+	// where they are: culled by it, car bodies vanished while their wheels (not skinned) stayed, until a hit broke the car into parts (reported: "cars are just wheels").
+	if (vsProg.skinned === undefined) vsProg.skinned = /skin/i.test(vsProg.label || '');
+	if (vsProg.skinned) return false;
 	// the game's matrices: at register b1 (rage_matrices); a vertex shader whose b1 never holds them is searched once at the other registers (another build may bind them
 	// elsewhere), and the register found is kept for it; one with none anywhere after 64 tries is left alone
 	let slot = vsProg.chunkSlot;
@@ -929,11 +945,9 @@ function chunkCull(vsProg, psProg, inst) {
 	if (chunkCam.frame !== presentCount) { if (mrt < 3) return false; chunkCam.frame = presentCount; chunkCam.x = cx; chunkCam.y = cy; chunkCam.cx = Math.floor(cx / CHUNK.cell); chunkCam.cy = Math.floor(cy / CHUNK.cell); chunkFrames++; }
 	else if (Math.abs(cx - chunkCam.x) > 0.05 || Math.abs(cy - chunkCam.y) > 0.05) return false;		// not the frame's main view
 	const dx = x - cx, dy = y - cy, d2 = dx * dx + dy * dy;
-	if (kind === 2 && CHUNK.people > 0 && d2 > CHUNK.people * CHUNK.people) return true;
-	if (kind === 3 && CHUNK.details > 0 && d2 > CHUNK.details * CHUNK.details) return true;
+	// decals (road markings, dirt) and glass follow the grid like the objects they lie on (shorter distances of their own left roads bare and windows open)
 	if (kind === 4 && CHUNK.lodTrees > 0 && d2 > CHUNK.lodTrees * CHUNK.lodTrees) return true;
 	if (kind === 5 && CHUNK.trees > 0 && d2 > CHUNK.trees * CHUNK.trees) return true;
-	if (kind === 6 && CHUNK.glass > 0 && d2 > CHUNK.glass * CHUNK.glass) return true;
 	return Math.abs(Math.floor(x / CHUNK.cell) - chunkCam.cx) > 1 || Math.abs(Math.floor(y / CHUNK.cell) - chunkCam.cy) > 1;
 }
 // a water-reflection draw makes its target a reflection (redrawn every REFLECT_EVERY frames from now); anything but the sky or clouds in a water reflection undoes that for good

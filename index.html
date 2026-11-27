@@ -519,11 +519,11 @@ const LOW_ARGS = () => ['-textureQuality=0', '-pedVariety=0', '-vehicleVariety=0
 // Fastest, Fast and Balanced differ only in resolution: the same lowest world, effects off (EFFECTS_OFF) and reflections redrawn every 30th frame (wgpu_worker.js REFLECT_EVERY).
 // On a 4-thread Chromebook (Intel N100) the frame time is set mostly by the number of draws (~1,100 at the lowest settings), not by pixels: resolution buys some frames, not all.
 const QUALITY = {
-	fastest: { label: 'Fastest', scale: 0.35, cap: [960, 540], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '64,40,20,40,35,25', fpsGoal: 50, aheadPlay: 0,
-		about: '35 % resolution (very blurry), the lowest world and effects; the draw distance shrinks or grows to keep about 50 frames per second. A fallback for the weakest graphics chips.' },
-	fast: { label: 'Fast', scale: 0.45, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '100,60,30,80,60,40', fpsGoal: 40, aheadPlay: 0,
-		about: '45 % resolution, the lowest world and effects; the draw distance shrinks or grows to keep about 40 frames per second.' },
-	balanced: { label: 'Balanced', scale: 0.58, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '150,90,50', fpsGoal: 30,
+	fastest: { label: 'Fastest', scale: 0.35, cap: [960, 540], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '120,0,0,150,100,0', fpsGoal: 50, aheadPlay: 0,
+		about: '35 % resolution (very blurry), the lowest world and effects; buildings and props drawn in 120 m chunks around you (growing when there is room), trees within 100 m. People and cars are always drawn. A fallback for the weakest graphics chips.' },
+	fast: { label: 'Fast', scale: 0.45, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '150,0,0,200,150,0', fpsGoal: 40, aheadPlay: 0,
+		about: '45 % resolution, the lowest world and effects; buildings and props drawn in 150 m chunks around you (between 120 and 300 m, following the frame rate), trees within 150 m.' },
+	balanced: { label: 'Balanced', scale: 0.58, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '150', fpsGoal: 30,
 		about: '58 % resolution. Buildings and props drawn only in the 3x3 chunks around you (the ground stays to the horizon), with the chunk size following the frame rate to keep about 30 frames per second. No shadows, ambient occlusion, depth of field, motion blur or anti-aliasing; reflections redrawn every 30th frame; fewest people and cars, lower texture detail. For Chromebooks and laptops.' },
 	full: { label: 'Full', scale: 1, cap: [3840, 2160], args: () => [], reflect: 1, effectsOff: false, chunk: '0',
 		about: 'Native resolution and the game\'s own settings (effects the other presets turned off come back). For gaming PCs.' },
