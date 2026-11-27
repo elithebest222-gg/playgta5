@@ -456,11 +456,12 @@ function fpsDetail(d) {
 	const extra = [d.pipe >= 1 && 'compiling shaders ' + ms(d.pipe), d.up >= 1 && 'uploads ' + ms(d.up)].filter(Boolean).join(' · ');
 	// what the per-draw savings did this frame: clears that became part of the next pass, constant uploads that matched the last ones, draws that could not touch a pixel
 	const saved = [d.merged >= 1 && Math.round(d.merged) + ' clears folded', d.reused >= 1 && Math.round(d.reused) + ' constants reused', d.noop >= 1 && Math.round(d.noop) + ' empty draws skipped'].filter(Boolean).join(' · ');
+	const chunks = d.chunk && d.chunk.cell > 0 ? 'chunks: 3x3 of ' + d.chunk.cell + ' m' + (d.chunk.people ? ', people and cars ' + d.chunk.people + ' m' : '') + ' · ' + Math.round(d.culled || 0) + ' far draws left out' : '';
 	// what the draws are (the shader effect: ped, vehicle_*, trees*, normal*... = buildings and props, im = blits and UI, ...) and the reflection cube map's share
 	const top = (d.top || []).filter((x) => x[1] >= 1).map((x) => x[0] + ' ' + Math.round(x[1])).join(' · ');
 	const refl = (d.refl || 0) + (d.reflSkip || 0) >= 1 ? 'reflections ' + Math.round(d.refl || 0) + ' drawn' + (d.reflSkip >= 1 ? ', ' + Math.round(d.reflSkip) + ' skipped (each face every ' + d.reflEvery + ' frames)' : '') : '';
 	return ms(d.ms) + ' a frame · ' + Math.round(d.draws) + ' draws\nGPU busy ' + ms(gpu) + ' · translating ' + ms(work) + ' · waiting for the game ' + ms(d.idle) + (d.wait >= 0.5 ? ' · waiting for the GPU ' + ms(d.wait) : '') + (extra ? '\n' + extra : '') +
-		(top ? '\nmost drawn: ' + top : '') + (refl ? '\n' + refl : '') + (saved ? '\nsaved: ' + saved : '') + '\nslowest: ' + slowest;
+		(top ? '\nmost drawn: ' + top : '') + (refl ? '\n' + refl : '') + (saved ? '\nsaved: ' + saved : '') + (chunks ? '\n' + chunks : '') + '\nslowest: ' + slowest;
 }
 // FPS counter, top left: off by default, the = key toggles it. The GPU worker counts presented frames and posts the rate twice a second on 'game-fps'. The key does not reach
 // the game (capture phase on window, before the input handlers; this build has debug key bindings).
@@ -514,13 +515,13 @@ const LOW_ARGS = () => ['-textureQuality=0', '-pedVariety=0', '-vehicleVariety=0
 // Fastest, Fast and Balanced differ only in resolution: the same lowest world, effects off (EFFECTS_OFF) and reflections redrawn every 30th frame (wgpu_worker.js REFLECT_EVERY).
 // On a 4-thread Chromebook (Intel N100) the frame time is set mostly by the number of draws (~1,100 at the lowest settings), not by pixels: resolution buys some frames, not all.
 const QUALITY = {
-	fastest: { label: 'Fastest', scale: 0.35, cap: [960, 540], args: LOW_ARGS, reflect: 30, effectsOff: true,
-		about: '35 % resolution (very blurry), the lowest world and effects. A fallback for the weakest graphics chips.' },
-	fast: { label: 'Fast', scale: 0.45, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true,
-		about: '45 % resolution, the lowest world and effects.' },
-	balanced: { label: 'Balanced', scale: 0.58, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true,
-		about: '58 % resolution. No shadows, ambient occlusion, depth of field, motion blur or anti-aliasing; reflections redrawn every 30th frame; fewest people and cars, shortest draw distance, lower texture detail. For Chromebooks and laptops.' },
-	full: { label: 'Full', scale: 1, cap: [3840, 2160], args: () => [], reflect: 1, effectsOff: false,
+	fastest: { label: 'Fastest', scale: 0.35, cap: [960, 540], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '100,60,30',
+		about: '35 % resolution (very blurry), the lowest world and effects, buildings and props drawn in 100 m chunks around you, people and cars within 60 m. A fallback for the weakest graphics chips.' },
+	fast: { label: 'Fast', scale: 0.45, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '120,75,40',
+		about: '45 % resolution, the lowest world and effects, buildings and props drawn in 120 m chunks around you, people and cars within 75 m.' },
+	balanced: { label: 'Balanced', scale: 0.58, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '150,90,50',
+		about: '58 % resolution. Buildings and props drawn only in the 3x3 chunks of 150 m around you (the ground stays to the horizon), people and cars within 90 m. No shadows, ambient occlusion, depth of field, motion blur or anti-aliasing; reflections redrawn every 30th frame; fewest people and cars, lower texture detail. For Chromebooks and laptops.' },
+	full: { label: 'Full', scale: 1, cap: [3840, 2160], args: () => [], reflect: 1, effectsOff: false, chunk: '0',
 		about: 'Native resolution and the game\'s own settings (effects the other presets turned off come back). For gaming PCs.' },
 };
 // The device's default: Balanced on a Chromebook or with 4 or fewer CPU threads (the low-memory profile, 4 GB or less, always runs Fast), Full otherwise
@@ -652,6 +653,9 @@ function startEngine(local) {
 		// the environment cube map (reflections on cars, glass and water) redrawn every n-th frame per face (wgpu_worker.js REFLECT_EVERY): ~180 draws a frame saved at most;
 		// ?reflect=n sets it (1: every frame)
 		reflect: Math.max(1, +(q.get('reflect') || 0) || preset.reflect || 1),
+		// chunks: only the world in the 3x3 cells around the camera is drawn (wgpu_worker.js CHUNK): cell size, people and vehicles' distance, decals' distance in metres;
+		// ?chunk=0 turns it off, ?chunk=200,100,60 sets it
+		chunk: q.get('chunk') !== null ? q.get('chunk') : preset.chunk || '0',
 	}, [offscreen]);
 	// ?mem=1 (diagnostics, needs ?log=1): performance.measureUserAgentSpecificMemory() every 15 s (needs cross-origin isolation), posted to the dev server's log.
 	if (remoteLog && (q.get('mem') || lowMemory) && performance.measureUserAgentSpecificMemory) {		// with ?log=1 on by default in the low-memory profile: the last reading before a crash/stall is in the log
@@ -1288,7 +1292,11 @@ function startGame(prep) {
 	startTitle();
 	startProgress();
 	// the game's own settings file first (EFFECTS_OFF): the engine reads it at its start
-	tuneGameSettings(QUALITY[isLowMemory() ? 'fast' : quality].effectsOff).then((note) => { console.log('[page] game settings: ' + note); postLog('[page] game settings: ' + note); }).finally(() => startEngine(prep.local));
+	tuneGameSettings(QUALITY[isLowMemory() ? 'fast' : quality].effectsOff).then((note) => {
+		console.log('[page] game settings: ' + note); postLog('[page] game settings: ' + note);
+		if (/^turned off/.test(note)) toast('Turned off the game\'s ambient occlusion, depth of field, motion blur and anti-aliasing');
+		else if (/^no settings file/.test(note)) toast('Effects turn off from the next start (the game writes its settings first)');
+	}).finally(() => startEngine(prep.local));
 }
 anywayBtn.onclick = () => { if (prepared) startGame(prepared); };
 chooseBtn.onclick = async () => {
