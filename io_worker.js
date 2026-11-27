@@ -479,6 +479,17 @@ let localFiles = null;		// file id -> File (null: not in the player's folder); n
 const LBS = 65536, LCACHE_MAX = 64 * 1048576;
 const lcache = new Map(), linflight = new Map();		// id * 1048576 + block -> Uint8Array (LRU) / Promise of it
 let lcacheBytes = 0, localErrors = 0;
+// At most LOCAL_READS_MAX reads of the player's files in flight; the rest wait their turn in order. The engine's threads ask for many ranges at once while the world streams in
+// (driving), and on a 4-thread Chromebook a dozen parallel disk reads only compete with each other and with the browser's own file thread for the same cores and storage.
+const LOCAL_READS_MAX = 4;
+let localReading = 0;
+const localQueue = [];
+async function readBlob(blob) {
+	if (localReading >= LOCAL_READS_MAX) await new Promise((res) => localQueue.push(res));		// the finishing read hands its turn over (the count stays)
+	else localReading++;
+	try { return new Uint8Array(await blob.arrayBuffer()); }
+	finally { const next = localQueue.shift(); if (next) next(); else localReading--; }
+}
 // A read that failed (a file missing from the folder, or one that changed or went away since it was picked: the browser then refuses to read it): the engine retries
 // some reads forever, so say it where the player can see it (index.html shows `ioError` in its status line), a few times at most.
 function localError(path, e) {
@@ -495,7 +506,7 @@ function localBlock(id, block) {
 	if (!p) {
 		p = (async () => {
 			const file = localFiles[id], a = block * LBS;
-			const data = new Uint8Array(await file.slice(a, Math.min(file.size, a + LBS)).arrayBuffer());
+			const data = await readBlob(file.slice(a, Math.min(file.size, a + LBS)));
 			report(data.length); tally(files[id], data.length);
 			lcache.set(key, data); lcacheBytes += data.length;
 			while (lcacheBytes > LCACHE_MAX) { const old = lcache.keys().next().value; lcacheBytes -= lcache.get(old).length; lcache.delete(old); }
@@ -549,7 +560,7 @@ async function readLocal(id, off, len, dst) {
 		return end - off;
 	}
 	if (end - off >= LBS) {
-		const data = new Uint8Array(await file.slice(off, end).arrayBuffer());
+		const data = await readBlob(file.slice(off, end));
 		report(data.length); tally(f, data.length);
 		views();
 		HEAPU8.set(data, dst);

@@ -500,8 +500,9 @@ function shaderProgram(sh) {
 	const source = isNode ? fs.readFileSync(shaderDir + '/' + sh.hash + '.wgsl', 'utf8') : (sh.fetched && sh.fetched.text);
 	if (!source) { logOnce('nosrc' + sh.hash, 'shader source of ' + sh.hash + ' was not fetched'); return null; }
 	const { text: packed, pack } = packUniforms(source);
-	let text = nanRules ? d3dNanRules(packed.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, '')) : packed;		// see d3dNanRules (comments out first: a "max(" in one would mislead it)
-	if (nanRules && sh.stage === 1) text = nanFirewall(text);
+	let text = nanRules || nanFire ? packed.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, '') : packed;		// comments out first: a "max(" or "main_inner(" in one would mislead the rewrites
+	if (nanRules) text = d3dNanRules(text);		// see d3dNanRules (opt-in)
+	if (nanFire && sh.stage === 1) text = nanFirewall(text);
 	shaderModuleCount++;
 	const tm0 = performance.now();
 	const module = device.createShaderModule({ code: text, label: rec.effect + '::' + rec.program });
@@ -612,7 +613,12 @@ const STAGE_NAME = ['vs', 'ps', 'cs'];
 // lighting buffer came out ~95 % NaN, shown as white snow, trees and walls (Direct3D 12 on Windows follows the D3D rules, so this is off there). Each call is
 // rewritten with explicit NaN tests, the way D3D-on-Vulkan layers use NMin/NMax/NClamp. A call whose (rewritten) arguments are long is left as it is (each
 // argument is repeated a few times). ?nansafe=1 / ?nansafe=0 on the page forces it on or off.
-const nanRules = !isNode && ((p) => (p === '1' || p === '0' ? p === '1' : !/Windows/.test(self.navigator.userAgent)))(new URLSearchParams(self.location.search).get('nansafe'));
+// Opt-in since the firewall below (?nansafe=1): with it on, an Intel Chromebook's lighting buffer still came out ~83 % NaN (the NaN hunt of 2026-11), so the rules did not stop
+// the NaN there, while every min/max/clamp/saturate cost several extra instructions in every shader (and bigger shaders to compile) on GPUs that do not fold them away.
+const nanParam = isNode ? null : new URLSearchParams(self.location.search).get('nansafe');
+const nanRules = !isNode && nanParam === '1';
+// The firewall: on except on Windows (Direct3D 12 follows D3D's NaN rules); ?nansafe=0 turns it off, ?nansafe=1 on.
+const nanFire = !isNode && (nanParam === '1' || (nanParam !== '0' && !/Windows/.test(self.navigator.userAgent)));
 // Pixel shader outputs: a NaN or infinite component becomes 0 before it is written (with the NaN rules: not on Windows). On an Intel Chromebook the sun's deferred light
 // (directional::PS_directional_standard) still wrote NaN/Inf into ~83 % of the lighting buffer, shown as white. With this no pass can hand NaN on to the next through a
 // render target, and a pass that makes it leaves those pixels without its light (darker, not white). The outputs are the module's o0..o7, written by main_inner() (as
@@ -786,7 +792,10 @@ function reflectDue(t, slice) {
 	if (REFLECT_EVERY <= 1 || slice > 5) return true;
 	const last = t.reflect[slice];
 	if (last === presentCount) return true;		// this face is being redrawn this frame
-	if (presentCount - last < REFLECT_EVERY) return false;
+	if (presentCount - last < REFLECT_EVERY + (t.reflectLag ? t.reflectLag[slice] : 0)) return false;
+	// the first time, the faces are spread over the interval (face k one k-th later), so they are not all redrawn in one frame (~180 draws at once)
+	if (last < 0) (t.reflectLag || (t.reflectLag = new Int32Array(6)))[slice] = (slice * REFLECT_EVERY / 6) | 0;
+	else if (t.reflectLag) t.reflectLag[slice] = 0;
 	t.reflect[slice] = presentCount;
 	return true;
 }
@@ -2970,7 +2979,7 @@ async function nanScanAfterDraw() {
 			if (nanHuntDetails === 1 && !isNode) {		// everything needed to find the cause, for the page to copy: the device, the draw's inputs, the shaders
 				const info = adapter.info || {};
 				const report = ['GTA V browser runtime: NaN hunt report', 'GPU: ' + [info.vendor, info.architecture, info.device, info.description].filter(Boolean).join(' ') + ' | lacks: ' + (['texture-compression-bc', 'float32-filterable', 'depth32float-stencil8', 'rg11b10ufloat-renderable'].filter((f) => !device.features.has(f)).join(', ') || 'nothing'),
-					'Limits: textures/stage ' + device.limits.maxSampledTexturesPerShaderStage + ', inter-stage ' + device.limits.maxInterStageShaderVariables + ' | NaN rules ' + nanRules + ' | UA ' + self.navigator.userAgent,
+					'Limits: textures/stage ' + device.limits.maxSampledTexturesPerShaderStage + ', inter-stage ' + device.limits.maxInterStageShaderVariables + ' | NaN rules ' + nanRules + ', firewall ' + nanFire + ' | UA ' + self.navigator.userAgent,
 					'Target ' + r.tex + ' ' + w + 'x' + h + ' ' + t.format + ': ' + bad + ' of 2560 samples bad after ' + nanHuntLabel, '', ...detail, '',
 					'==== vertex shader ' + (nanHuntVs ? nanHuntVs.label : '-') + ' ====', nanHuntVs ? nanHuntVs.text : '', '==== pixel shader ' + (nanHuntPs ? nanHuntPs.label : '-') + ' ====', nanHuntPs ? nanHuntPs.text : ''].join('\n');
 				(gpuErrorChannel || (gpuErrorChannel = new BroadcastChannel('game-progress'))).postMessage({ nanReport: report });
