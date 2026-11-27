@@ -141,7 +141,7 @@ let noF32Filter = false, noD32S8 = false, noRG11 = false;
 let mem = null, memBuffer = null, i32 = null, u32 = null, f32 = null, u8 = null, ringBase = 0, ringSize = 0;
 let canvas = null, canvasCtx = null, canvasFormat = null, blit = null, canvasConfigured = false;
 let fpsChannel = null, fpsOverlayN = 0, fpsOverlayT = 0, overlayOn = false;		// overlayOn: the page shows the overlay ('=' key): only then are frames timed on the chip (gpuTiming)
-const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0, merged: 0, reused: 0, noop: 0, culled: 0, chunkFrames: 0, mods: 0, pipes: 0, sized: 0, sizedK: 0, hidden: 0, passes: 0, submits: 0, bgs: 0, upBytes: 0, staged: 0 };		// merged/reused/noop: the counters' values at the last report		// the frame-rate overlay's sums since its last report (present)
+const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0, merged: 0, reused: 0, noop: 0, culled: 0, chunkFrames: 0, mods: 0, pipes: 0, sized: 0, sizedK: 0, hidden: 0, passes: 0, submits: 0, bgs: 0, upBytes: 0, staged: 0, mips: 0, mipsSkipped: 0, kept: null, passDraw: 0, passProxy: 0, passClear: 0 };		// merged/reused/noop: the counters' values at the last report		// the frame-rate overlay's sums since its last report (present)
 const ovProgs = [];		// the programs drawn since the overlay's last report, each with its count in `ovN` (summed per effect for the report)
 // The GPU's share of a frame (the overlay's "GPU"): the time during which some submitted work is not finished yet, from the submit to the moment this worker learns that the
 // newest submit is done (its event loop gets a turn at least every 2 ms). It includes the GPU process's own work on the commands, so it is a little long, never short.
@@ -252,7 +252,7 @@ let passSt = newPassSt();
 let encEpoch = 1, submits = 0, submits0 = 0;
 const usedInEncoder = { add(o) { if (o) o.enc = encEpoch; }, has(o) { return !!o && o.enc === encEpoch; }, clear() { encEpoch++; } };
 const flushReasons = new Map(), ovReasons = new Map();		// submits per reason since the last fps line / the overlay's last report
-let passesBegun = 0;
+let passesBegun = 0, passDrawN = 0, passProxyN = 0, passClearN = 0;		// all passes; those for draws (ensurePass), depth/float copies (proxies), clears of their own
 function flush(reason) {
 	const tf0 = performance.now();
 	if (encoder || pass) { const r = reason || 'other'; flushReasons.set(r, (flushReasons.get(r) || 0) + 1); ovReasons.set(r, (ovReasons.get(r) || 0) + 1); }
@@ -382,7 +382,7 @@ function layoutEntry(b, stage) {
 	case 'read-only-storage': e.buffer = { type: 'read-only-storage' }; break;
 	case 'sampler': e.sampler = { type: 'filtering' }; break;
 	case 'sampler-comparison': e.sampler = { type: 'comparison' }; break;
-	case 'texture': e.texture = { sampleType: noF32Filter && b.loadOnly ? 'unfilterable-float' : b.sample, viewDimension: b.dim, multisampled: !!b.ms }; break;		// loadOnly: parseWgsl
+	case 'texture': e.texture = { sampleType: (noF32Filter || DEPTH_DIRECT) && b.loadOnly ? 'unfilterable-float' : b.sample, viewDimension: b.dim, multisampled: !!b.ms }; break;		// loadOnly: parseWgsl; DEPTH_DIRECT: srvView
 	case 'storage-texture': e.storageTexture = { access: b.access, format: b.format, viewDimension: b.dim }; break;
 	}
 	return e;
@@ -1004,50 +1004,54 @@ function chunkCb(slot) {
 }
 let chunkCbOff = 0;
 // Is this draw an object of the world that is too far, too small for its distance, or hidden (occlusion, below)? 0: draw it, 1: too far or too small, 2: hidden
+// Why a draw of the world (kinds 1-7) was kept, counted for the overlay (what to look at next): KEPT_WHY names the counters of keptWhy
+const KEPT_WHY = ['instanced', 'other pass', 'skinned', 'no matrices', 'no position', 'other view', 'size unknown', 'near', 'before the camera'];
+const keptWhy = new Float64Array(KEPT_WHY.length);
 function chunkCull(vsProg, psProg, inst) {
-	if (inst > 1) return 0;
-	let mrt = 0;
-	for (let i = 0; i < 8; i++) if (S.rt[i].tex) mrt++;
-	if (!mrt) return 0;		// depth-only passes (occlusion, shadows): never
-	if (mrt < 3 && chunkCam.frame !== presentCount) return 0;		// passes with fewer targets (glass, foliage, decals drawn see-through) only after the G-buffer gave the frame's camera
 	const prog = psProg || vsProg;
 	const kind = prog.chunkKind !== undefined ? prog.chunkKind : (prog.chunkKind = chunkKind(prog.label || ''));
 	if (!kind) return 0;
+	if (inst > 1) { keptWhy[0]++; return 0; }
+	let mrt = 0;
+	for (let i = 0; i < 8; i++) if (S.rt[i].tex) mrt++;
+	if (!mrt) { keptWhy[1]++; return 0; }		// depth-only passes (occlusion, shadows): never
+	if (mrt < 3 && chunkCam.frame !== presentCount) { keptWhy[1]++; return 0; }		// passes with fewer targets (glass, foliage, decals drawn see-through) only after the G-buffer gave the frame's camera
 	// Skinned meshes (vehicles' bodies, people, breakable props: lamp posts, signs, fences; VS_*Skin*) are placed by their bone matrices, and the object matrix at b1 is not
 	// where they are: culled by it, car bodies vanished while their wheels (not skinned) stayed, until a hit broke the car into parts (reported: "cars are just wheels").
 	// The rigid parts of people and vehicles (wheels, lights, props, weapons) are placed by it, and are only left out when too small for their distance (a wheel 60 m away
 	// on Fastest: a pixel or two), never for distance or because hidden (they move: the depth grid is a frame or two old).
 	if (vsProg.skinned === undefined) vsProg.skinned = /skin/i.test(vsProg.label || '');
-	if (vsProg.skinned) return 0;
+	if (vsProg.skinned) { keptWhy[2]++; return 0; }
 	// the game's matrices: at register b1 (rage_matrices); a vertex shader whose b1 never holds them is searched once at the other registers (another build may bind them
 	// elsewhere), and the register found is kept for it; one with none anywhere after 64 tries is left alone
 	let slot = vsProg.chunkSlot;
 	if (slot === undefined) {
 		const tries = (vsProg.chunkTries = (vsProg.chunkTries || 0) + 1);
 		for (const k of [1, 0, 2, 3, 4, 5, 6, 7]) { const f = chunkCb(k); if (f && chunkMatrices(f, chunkCbOff, false)) { slot = vsProg.chunkSlot = k; break; } }
-		if (slot === undefined) { if (tries >= 64) vsProg.chunkSlot = -1; return 0; }
+		if (slot === undefined) { if (tries >= 64) vsProg.chunkSlot = -1; keptWhy[3]++; return 0; }
 	}
-	if (slot < 0) return 0;
+	if (slot < 0) { keptWhy[3]++; return 0; }
 	const first = chunkCam.frame !== presentCount;
 	const f = chunkCb(slot);
-	if (!f || !chunkMatrices(f, chunkCbOff, first && mrt >= 3) || chunkIdent) return 0;		// not the matrices this time, or no translation (instanced and world-space geometry)
+	if (!f || !chunkMatrices(f, chunkCbOff, first && mrt >= 3)) { keptWhy[3]++; return 0; }		// not the matrices this time
+	if (chunkIdent) { keptWhy[4]++; return 0; }		// no translation (instanced and world-space geometry: placed elsewhere)
 	const cx = chunkCamPos[0], cy = chunkCamPos[1], cz = chunkCamPos[2];
 	if (first) {
-		if (mrt < 3 || kind === 2) return 0;		// the frame's camera from a world object of the G-buffer (first-person arms and weapons may have a projection of their own)
+		if (mrt < 3 || kind === 2) { keptWhy[8]++; return 0; }		// the frame's camera from a world object of the G-buffer (first-person arms and weapons may have a projection of their own)
 		chunkCam.frame = presentCount; chunkCam.x = cx; chunkCam.y = cy; chunkCam.z = cz; chunkFrames++;
 		if (OCCL) occlFrameView();
-	} else if (Math.abs(cx - chunkCam.x) > 0.05 || Math.abs(cy - chunkCam.y) > 0.05 || Math.abs(cz - chunkCam.z) > 0.05) return 0;		// not the frame's main view
+	} else if (Math.abs(cx - chunkCam.x) > 0.05 || Math.abs(cy - chunkCam.y) > 0.05 || Math.abs(cz - chunkCam.z) > 0.05) { keptWhy[5]++; return 0; }		// not the frame's main view
 	const vb = S.vb[0], o = vb.buf ? objs.get(vb.buf) : null;
-	if (!o || !o.gpu) return 0;
-	if (o.boxSt !== 3) { if (o.boxSt === undefined && vb.offset === 0) vbBoxRequest(o, S.layout ? objs.get(S.layout) : null, vb.stride); chunkUnsized++; return 0; }
-	if (vb.offset !== 0 || vb.stride !== o.boxStride) { chunkUnsized++; return 0; }
+	if (!o || !o.gpu) { keptWhy[6]++; return 0; }
+	if (o.boxSt !== 3) { if (o.boxSt === undefined && vb.offset === 0) vbBoxRequest(o, S.layout ? objs.get(S.layout) : null, vb.stride); chunkUnsized++; keptWhy[6]++; return 0; }
+	if (vb.offset !== 0 || vb.stride !== o.boxStride) { chunkUnsized++; keptWhy[6]++; return 0; }
 	chunkSized++;
 	// the box placed in the world: its centre, and the half sizes of the box around it along the map's axes
 	const bx = o.box, W = chunkW;
 	const lx = (bx[0] + bx[3]) * 0.5, ly = (bx[1] + bx[4]) * 0.5, lz = (bx[2] + bx[5]) * 0.5, ex = (bx[3] - bx[0]) * 0.5, ey = (bx[4] - bx[1]) * 0.5, ez = (bx[5] - bx[2]) * 0.5;
 	const wx = lx * W[0] + ly * W[4] + lz * W[8] + W[12], wy = lx * W[1] + ly * W[5] + lz * W[9] + W[13], wz = lx * W[2] + ly * W[6] + lz * W[10] + W[14];
 	const hx = Math.abs(W[0]) * ex + Math.abs(W[4]) * ey + Math.abs(W[8]) * ez, hy = Math.abs(W[1]) * ex + Math.abs(W[5]) * ey + Math.abs(W[9]) * ez, hz = Math.abs(W[2]) * ex + Math.abs(W[6]) * ey + Math.abs(W[10]) * ez;
-	if (kind === 7) return OCCL && occlHidden(bx) ? 2 : 0;		// the ground: only when hidden (it reaches the horizon)
+	if (kind === 7) { if (OCCL && occlHidden(bx)) return 2; keptWhy[7]++; return 0; }		// the ground: only when hidden (it reaches the horizon)
 	if (CHUNK.dist > 0 && kind !== 2) {
 		const dx = Math.max(0, Math.abs(wx - cx) - hx), dy = Math.max(0, Math.abs(wy - cy) - hy);
 		if (dx * dx + dy * dy > CHUNK.dist * CHUNK.dist) return 1;
@@ -1057,6 +1061,7 @@ function chunkCull(vsProg, psProg, inst) {
 		if (d2 > r2 && r2 < CHUNK.tiny * CHUNK.tiny * d2) return 1;
 	}
 	if (OCCL && kind !== 2 && occlHidden(bx)) return 2;
+	keptWhy[7]++;
 	return 0;
 }
 // ---- occlusion: what an earlier frame's depth shows is hidden is left out -----------------------------------------------------------------------------------
@@ -1405,7 +1410,7 @@ function uploadTexture(id, mip, slice, x, y, z, w, h, d, bytesPerRow, rowsPerIma
 	const pend = pendingClears.length && pendingHas(id);
 	if (pend) flushPendingClears();
 	const inUse = pend || usedInEncoder.has(o);
-	markColorDirty(o);
+	markColorDirty(o, o.desc.dimension === '3d' ? undefined : slice);
 	if (debugDraw || debugPs) { o.uploads = (o.uploads || 0) + 1; o.lastUpload = 'mip' + mip + ' ' + w + 'x' + h + ' bpr' + bytesPerRow + ' first bytes ' + Array.from(u8.subarray(dataOff, dataOff + 8)).join(','); }		// dumpDraw only: a string per upload otherwise
 	const three = o.desc.dimension === '3d';
 	const origin = { x, y, z: three ? z : slice };
@@ -1690,14 +1695,29 @@ function dummyBuffer(binding) {
 	return b;
 }
 
+// A depth texture that a shader only loads from (textureLoad) as a float texture is bound as it is: its depth aspect, which WebGPU takes for an 'unfilterable-float'
+// binding (layoutEntry declares load-only float bindings so), with no copy pass (depthProxy: a render pass each time the depth changed; on a throttled N100 a pass costs
+// Chrome's GPU process ~0.5 ms, a dozen draws' worth). While the current pass writes that depth (a writable attachment cannot be read in its own pass) it is not bound
+// at all: D3D unbinds an SRV of the depth buffer being written, so the shader reads zeros (a dummy texture). Such bind groups get keys of their own (stageBG: -id) and
+// stay off the fast path (sawProxy), which would reuse them in a pass that writes the depth. ?depthdirect=0 turns it off (diagnostics).
+const DEPTH_DIRECT = isNode ? process.env.WGPU_DEPTH_DIRECT !== '0' : new URLSearchParams(self.location.search).get('depthdirect') !== '0';
+// 0: not this case (a copy as before), 1: bound as it is, 2: not bound (the pass writes it)
+function depthDirectMode(srv, b) {
+	if (!DEPTH_DIRECT || b.sample !== 'float' || !b.loadOnly || srv.fmt === 47 || srv.fmt === 22) return 0;
+	return S.ds.tex === srv.res && !(S.ds.flags & 1) ? 2 : 1;
+}
+let srvDirect = false, depthDirectViews = 0;		// srvDirect: the last srvView gave a depth texture as it is
 function srvView(srv, b) {
 	// GPUTextureView of an SRV in the dimension the shader declares
 	let t = objs.get(srv.res);
+	srvDirect = false;
 	if (!t || t.kind !== 'texture') return null;
 	let proxied = false;
 	if (isDepth(t.format) && b.sample !== 'depth') {
-		t = depthProxy(t, b.sample === 'uint' ? 'stencil' : 'depth', noF32Filter && b.loadOnly);
-		proxied = true; sawProxy = true;
+		const dd = depthDirectMode(srv, b);
+		if (dd === 2) { sawProxy = true; return null; }		// this pass writes it: not bound, as D3D does (a dummy reads zeros)
+		if (dd === 1) { srvDirect = true; sawProxy = true; depthDirectViews++; }		// the depth aspect itself (see above)
+		else { t = depthProxy(t, b.sample === 'uint' ? 'stencil' : 'depth', noF32Filter && b.loadOnly); proxied = true; sawProxy = true; }
 	} else if (!isDepth(t.format) && b.sample === 'depth') {
 		t = floatToDepthProxy(t);
 		proxied = true; sawProxy = true;
@@ -1793,7 +1813,7 @@ function halfProxy(t) {
 			}
 		}
 		for (const r of px.passes) {
-			const p = enc.beginRenderPass({ colorAttachments: [{ view: r.dst, loadOp: 'clear', storeOp: 'store' }] });
+			passProxyN++; const p = enc.beginRenderPass({ colorAttachments: [{ view: r.dst, loadOp: 'clear', storeOp: 'store' }] });
 			p.setPipeline(pl);
 			p.setBindGroup(0, r.bg);
 			p.draw(3);
@@ -1833,7 +1853,7 @@ function floatToDepthProxy(t) {
 			}
 		}
 		for (const r of px.passes) {
-			const p = enc.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: r.dst, depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1 } });
+			passProxyN++; const p = enc.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: r.dst, depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1 } });
 			p.setPipeline(f2dPipeline);
 			p.setBindGroup(0, r.bg);
 			p.draw(3);
@@ -1844,7 +1864,15 @@ function floatToDepthProxy(t) {
 	}
 	return px;
 }
-function markColorDirty(t) { if (t && t.proxy_fdepth) t.proxy_fdepth.dirty = true; if (t && t.proxy_half) t.proxy_half.dirty = true; }
+// A colour texture was (or is about to be) written: its proxies are stale, and its mipmaps (generateMips) unless regenerated. `layer`: the array layer written (render
+// targets, clears, uploads), so a cube map whose faces are redrawn one at a time regenerates only those faces' mips; without it every layer counts as written.
+function markColorDirty(t, layer) {
+	if (!t) return;
+	if (t.proxy_fdepth) t.proxy_fdepth.dirty = true;
+	if (t.proxy_half) t.proxy_half.dirty = true;
+	if (layer === undefined || !t.lgen || layer >= t.lgen.length) t.wgen = (t.wgen || 0) + 1;
+	else t.lgen[layer]++;
+}
 
 function depthProxy(t, kind, full) {
 	// returns the proxy texture object of depth texture `t`, refreshed if the depth texture changed since the last refresh. full: a binding that only loads (r32float always)
@@ -1870,7 +1898,7 @@ function depthProxy(t, kind, full) {
 			}
 		}
 		for (const r of px.passes) {
-			const p = enc.beginRenderPass({ colorAttachments: [{ view: r.dst, loadOp: 'clear', storeOp: 'store' }] });
+			passProxyN++; const p = enc.beginRenderPass({ colorAttachments: [{ view: r.dst, loadOp: 'clear', storeOp: 'store' }] });
 			p.setPipeline(pl);
 			p.setBindGroup(0, r.bg);
 			p.draw(3);
@@ -2321,7 +2349,7 @@ function ensurePass() {
 		if (v.depthSlice !== undefined) att.depthSlice = v.depthSlice;
 		if (pendingClears.length) takeColorClear(att, r.tex, r.mip, r.slice, v.format, t);
 		colorAttachments.push(att);
-		markColorDirty(t);
+		markColorDirty(t, t.desc.dimension === '3d' ? undefined : r.slice);
 		rtInfo.push({ format: v.format });
 		samples = t.desc.sampleCount; any = true; passW = Math.max(1, t.desc.size.width >> r.mip); passH = Math.max(1, t.desc.size.height >> r.mip);
 		usedInEncoder.add(t);
@@ -2357,7 +2385,7 @@ function ensurePass() {
 		const t0 = S.rt[0].tex ? objs.get(S.rt[0].tex) : null;
 		timePass(desc, colorAttachments.length >= 3 ? 'G-buffer' : t0 && t0.reflect ? 'reflections' : (rtInfo[0] ? rtInfo[0].format : 'depth') + ' ' + passW + 'x' + passH);
 	}
-	pass = getEncoder().beginRenderPass(desc);
+	pass = getEncoder().beginRenderPass(desc); passDrawN++;
 	beginOcclusionInPass();
 	passInfo = { rtInfo, dsFormat, colorCount: colorAttachments.length, roDepth: !!dt && (S.ds.flags & 1) !== 0, roStencil: !!dt && (S.ds.flags & 2) !== 0, width: passW, height: passH };
 	applied = {};
@@ -2378,7 +2406,7 @@ function prepareDepthProxies(prog, stage) {
 		const b = texs[i];
 		const id = S.srv[stage][b.binding - 32], srv = id ? objs.get(id) : null;
 		const t = srv && !srv.isBuf ? objs.get(srv.res) : null;
-		if (t && t.kind === 'texture' && isDepth(t.format) && b.sample !== 'depth') { any = true; depthProxy(t, b.sample === 'uint' ? 'stencil' : 'depth', noF32Filter && b.loadOnly); }
+		if (t && t.kind === 'texture' && isDepth(t.format) && b.sample !== 'depth') { any = true; if (!depthDirectMode(srv, b)) depthProxy(t, b.sample === 'uint' ? 'stencil' : 'depth', noF32Filter && b.loadOnly); }		// bound as it is or not at all: no copy (DEPTH_DIRECT)
 		else if (t && t.kind === 'texture' && !isDepth(t.format) && b.sample === 'depth') { any = true; floatToDepthProxy(t); }
 		else if (t && t.kind === 'texture' && noF32Filter && b.sample === 'float' && !b.loadOnly && HALF_OF[t.format]) { any = true; halfProxy(t); }		// the 16-bit copies too (srvView)
 	}
@@ -2514,7 +2542,7 @@ function stageBindGroup(stage, prog, group, bgl) {
 			let v = null;
 			if (srv && !srv.isBuf) { v = srvView(srv, b); if (v) bgUse(objs.get(srv.res)); }
 			ent(b.binding, v || dummyTexture(b), -1, -1);
-			bgKey[bgKeyN++] = v ? id : 0;
+			bgKey[bgKeyN++] = v ? (srvDirect ? -id : id) : 0;		// a depth texture bound as it is: a bind group of its own (DEPTH_DIRECT)
 		} else if (b.kind === 'read-only-storage' || b.kind === 'storage') {
 			const isCounter = b.binding >= 176, isUav = b.binding >= 160;
 			const id = isUav ? S.uav[stage][b.binding - (isCounter ? 176 : 160)] : S.srv[stage][b.binding - 32];
@@ -3245,6 +3273,15 @@ function generateMips(srvId) {
 	if (!t || t.kind !== 'texture' || t.desc.mipLevelCount < 2) return;
 	const fmt = t.format;
 	if (isDepth(fmt) || fmt.startsWith('bc') || t.desc.dimension === '3d') { logOnce('mips' + fmt, 'GenerateMips: unsupported texture format/dimension ' + fmt + ' ' + t.desc.dimension); return; }
+	// The game regenerates some mipmaps every frame whether or not the picture changed: the reflection cube map's, 6 faces x ~7 levels = ~42 render passes a frame (a
+	// Chromebook's overlay showed 65 passes a frame, the chip busy 10 ms of an 80 ms frame: each pass costs Chrome's GPU process far more than the chip). Only the layers
+	// written since this texture's last generation are regenerated (markColorDirty); with reflections redrawn every 30th or 60th frame (REFLECT_EVERY), most frames none.
+	const layers = t.desc.size.depthOrArrayLayers;
+	if (!t.lgen) { t.lgen = new Int32Array(layers); t.mipL = new Int32Array(layers).fill(-1); t.mipW = -1; }
+	const all = t.mipW !== (t.wgen || 0);
+	let dirty = 0;
+	for (let layer = 0; layer < layers; layer++) if (all || t.lgen[layer] !== t.mipL[layer]) dirty++;
+	if (!dirty) { mipSkipped += layers * (t.desc.mipLevelCount - 1); return; }
 	endPass();
 	// Without float32-filterable a 32-bit float texture cannot be read through a linear sampler (the bind group is invalid, and with it the whole submit: the luminance
 	// average of auto exposure is made this way): each texel of the next mip is then the average of its 2x2 texels, read with textureLoad (what the linear sample at
@@ -3274,7 +3311,7 @@ function generateMips(srvId) {
 		mipPipelines.set(fmt, pl);
 	}
 	if (!mipSampler) mipSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
-	const enc = getEncoder(), layers = t.desc.size.depthOrArrayLayers;
+	const enc = getEncoder();
 	if (!t.mipPasses) {		// per texture, made once (GenerateMips runs every frame on some targets, e.g. the reflection map's mip blur)
 		t.mipPasses = [];
 		for (let layer = 0; layer < layers; layer++) for (let mip = 1; mip < t.desc.mipLevelCount; mip++) {
@@ -3283,15 +3320,26 @@ function generateMips(srvId) {
 			t.mipPasses.push({ dst, bg: device.createBindGroup({ layout: pl.getBindGroupLayout(0), entries: byLoad ? [{ binding: 0, resource: src }] : [{ binding: 0, resource: src }, { binding: 1, resource: mipSampler }] }) });
 		}
 	}
-	for (const r of t.mipPasses) {
-		const p = enc.beginRenderPass({ colorAttachments: [{ view: r.dst, loadOp: 'clear', storeOp: 'store' }] });
-		p.setPipeline(pl);
-		p.setBindGroup(0, r.bg);
-		p.draw(3);
-		p.end();
+	const per = t.desc.mipLevelCount - 1;
+	for (let layer = 0; layer < layers; layer++) {
+		if (!all && t.lgen[layer] === t.mipL[layer]) { mipSkipped += per; continue; }
+		for (let k = 0; k < per; k++) {
+			const r = t.mipPasses[layer * per + k];
+			const p = enc.beginRenderPass({ colorAttachments: [{ view: r.dst, loadOp: 'clear', storeOp: 'store' }] });
+			p.setPipeline(pl);
+			p.setBindGroup(0, r.bg);
+			p.draw(3);
+			p.end();
+			mipPassesRun++;
+		}
+		t.mipL[layer] = t.lgen[layer];
 	}
-	usedInEncoder.add(t); markColorDirty(t);
+	usedInEncoder.add(t);
+	if (t.proxy_fdepth) t.proxy_fdepth.dirty = true;
+	if (t.proxy_half) t.proxy_half.dirty = true;
+	t.mipW = t.wgen || 0;		// its own writes (mips 1 and up) do not make it stale
 }
+let mipPassesRun = 0, mipSkipped = 0;
 
 function blockInfo(format) {
 	if (format.startsWith('bc')) return { bytes: /^bc(1|4)/.test(format) ? 8 : 16, bw: 4, bh: 4 };
@@ -3354,7 +3402,7 @@ function clearRT(id, mip, slice, r, g, b, a) {
 	const t = objs.get(id);
 	if (!t || t.kind !== 'texture') return;
 	if (t.reflect && !reflectDue(t, slice)) return;		// a reflection face kept from an earlier frame (REFLECT_EVERY)
-	markColorDirty(t);
+	markColorDirty(t, t.desc.dimension === '3d' ? undefined : slice);
 	endPass();
 	queueClear({ t, id, mip, slice, depth: false, color: { r, g, b, a }, flags: 0, depthValue: 0, stencil: 0 });
 }
@@ -3391,7 +3439,7 @@ function runClear(c) {		// the clear as its own pass
 	if (objs.get(c.id) !== t) return;		// destroyed meanwhile
 	clearsRun++;
 	const view = clearView(t, c.mip, c.slice);
-	if (!c.depth) getEncoder().beginRenderPass(timePass({ colorAttachments: [Object.assign({ view, loadOp: 'clear', storeOp: 'store', clearValue: c.color }, t.desc.dimension === '3d' ? { depthSlice: c.slice } : null)] }, 'clears')).end();
+	passClearN++; if (!c.depth) getEncoder().beginRenderPass(timePass({ colorAttachments: [Object.assign({ view, loadOp: 'clear', storeOp: 'store', clearValue: c.color }, t.desc.dimension === '3d' ? { depthSlice: c.slice } : null)] }, 'clears')).end();
 	else {
 		const att = { view, depthLoadOp: (c.flags & 1) ? 'clear' : 'load', depthStoreOp: 'store', depthClearValue: c.depthValue };
 		if (hasStencil(t.format)) Object.assign(att, { stencilLoadOp: (c.flags & 2) ? 'clear' : 'load', stencilStoreOp: 'store', stencilClearValue: c.stencil });
@@ -3775,7 +3823,7 @@ async function present(id) {
 		const tn = performance.now();
 		if (!fpsChannel) { fpsChannel = new BroadcastChannel('game-fps'); fpsChannel.onmessage = (e) => { if (e.data && e.data.overlay !== undefined) overlayOn = !!e.data.overlay; }; }
 		fpsOverlayN++;
-		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.upBytes = 0; ovReasons.clear(); for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
+		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.mips = mipPassesRun; ov.passDraw = passDrawN; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear(); for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
 		else if (tn - fpsOverlayT >= 500) {
 			const n = Math.max(1, fpsOverlayN), ms = (tn - fpsOverlayT) / n, busy = gpuBusyMs(tn), gpuPer = (busy - ov.gpu) / n;
 			const byEffect = new Map();
@@ -3789,10 +3837,12 @@ async function present(id) {
 				occl: OCCL, hidden: (occlCulled - ov.hidden) / n, occlOn: OCCL && occlActive(), occlWhy: OCCL ? occlStatus() : '',
 				// what the GPU process got per frame: passes begun, submits and why, copies recorded instead of submits, bind groups made, MB uploaded
 				passes: (passesBegun - ov.passes) / n, submits: (submits - ov.submits) / n, why: [...ovReasons].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k, c]) => [k, c / n]),
-				staged: (stagedUploads + renamedBuffers - ov.staged) / n, bgs: (bgCreated - ov.bgs) / n, mb: ov.upBytes / n / 1048576,
+				staged: (stagedUploads + renamedBuffers - ov.staged) / n, mips: (mipPassesRun - ov.mips) / n, mipsSkipped: (mipSkipped - ov.mipsSkipped) / n,
+				passDraw: (passDrawN - ov.passDraw) / n, passProxy: (passProxyN - ov.passProxy) / n, passClear: (passClearN - ov.passClear) / n,
+				kept: KEPT_WHY.map((k, i) => [k, (keptWhy[i] - ov.kept[i]) / n]).filter((x) => x[1] >= 1).sort((a, b) => b[1] - a[1]).slice(0, 4), bgs: (bgCreated - ov.bgs) / n, mb: ov.upBytes / n / 1048576,
 				// shader modules and pipelines made per second: each is compiled by Chrome's GPU process (shown there only as "GPU busy"), many while new places stream in
 				newShaders: (shaderModuleCount - ov.mods) * 1000 / (tn - fpsOverlayT), newPipelines: (pipeCreates + aheadMade - ov.pipes) * 1000 / (tn - fpsOverlayT) });
-			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.upBytes = 0; ovReasons.clear();
+			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.mips = mipPassesRun; ov.passDraw = passDrawN; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear();
 			fpsOverlayN = 0; fpsOverlayT = tn; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = busy; ov.draws = drawCount;
 		}
 	}
