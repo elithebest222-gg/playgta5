@@ -145,16 +145,19 @@ const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSk
 const ovProgs = [];		// the programs drawn since the overlay's last report, each with its count in `ovN` (summed per effect for the report)
 // The GPU's share of a frame (the overlay's "GPU"): the time during which some submitted work is not finished yet, from the submit to the moment this worker learns that the
 // newest submit is done (its event loop gets a turn at least every 2 ms). It includes the GPU process's own work on the commands, so it is a little long, never short.
-let gpuSeq = 0, gpuDoneSeq = 0, gpuBusyT0 = 0;
+// gpuBusyMs(): all the busy time so far, the interval still open included (each reader keeps its own last value and takes the difference: while the GPU side never runs out
+// of work, which is when it is the slowest part, no interval closes, and counting only closed ones read as an idle GPU)
+let gpuSeq = 0, gpuDoneSeq = 0, gpuBusyT0 = 0, gpuBusyClosed = 0;
 function gpuTrack() {
 	const seq = ++gpuSeq;
 	if (seq === gpuDoneSeq + 1) gpuBusyT0 = performance.now();		// everything before was done: the GPU is busy from now
 	device.queue.onSubmittedWorkDone().then(() => {
 		if (seq <= gpuDoneSeq) return;
 		gpuDoneSeq = seq;
-		if (seq === gpuSeq) { const d = performance.now() - gpuBusyT0; ov.gpu += d; chunkWin.gpu += d; }		// nothing newer outstanding: idle from now
+		if (seq === gpuSeq) gpuBusyClosed += performance.now() - gpuBusyT0;		// nothing newer outstanding: idle from now
 	});
 }
+function gpuBusyMs(now) { return gpuBusyClosed + (gpuDoneSeq < gpuSeq ? now - gpuBusyT0 : 0); }
 let encoder = null, pass = null, passKey = '';
 let errorCount = 0, errorCount0 = 0, clampedDraws = 0, clampedDraws0 = 0, gpuErrorChannel = null;
 const errorKinds = new Map();		// normalised message -> { n, msg }
@@ -792,7 +795,7 @@ const REFLECT_EVERY = isNode ? +(process.env.WGPU_REFLECT_EVERY || 1) : Math.max
 // Anything else is drawn as before.
 const CHUNK = (() => {
 	const v = (isNode ? process.env.WGPU_CHUNK || '' : new URLSearchParams(self.location.search).get('chunk') || '').split(',').map((x) => Math.max(0, +x || 0));
-	return { cell: v[0] || 0, people: v[1] || 0, details: v[2] || 0 };
+	return { cell: v[0] || 0, people: v[1] || 0, details: v[2] || 0, lodTrees: v[3] || 0 };
 })();
 const chunkCam = { frame: -1, x: 0, y: 0, cx: 0, cy: 0 };
 let chunkCulled = 0;
@@ -801,7 +804,7 @@ let chunkCulled = 0;
 // game's own threads are what holds the frame rate: this worker waiting for their commands half the frame or more with the GPU side mostly free (fewer draws would not help).
 // (A rule that only shrank when one part was busy 70 % of the frame never fired on a 4-thread CPU, where the game's threads, this worker and the GPU process share the cores.)
 const CHUNK_AUTO = isNode ? 0 : Math.max(0, +(new URLSearchParams(self.location.search).get('chunkauto') || 0));
-const CHUNK_BASE = { cell: CHUNK.cell, people: CHUNK.people, details: CHUNK.details }, CHUNK_MIN_SCALE = 0.4, CHUNK_MAX_SCALE = 2;
+const CHUNK_BASE = { cell: CHUNK.cell, people: CHUNK.people, details: CHUNK.details, lodTrees: CHUNK.lodTrees }, CHUNK_MIN_SCALE = 0.4, CHUNK_MAX_SCALE = 2;
 let chunkScale = 1;
 const chunkWin = { t: 0, n: 0, idle: 0, wait: 0, gpu: 0 };		// this second's frames (present)
 function chunkAdaptStep(scale, ms, gpu, idle, target) {
@@ -812,14 +815,16 @@ function chunkAdaptStep(scale, ms, gpu, idle, target) {
 }
 function chunkApplyScale(scale) {
 	chunkScale = scale;
-	CHUNK.cell = Math.max(1, Math.round(CHUNK_BASE.cell * scale)); CHUNK.people = Math.round(CHUNK_BASE.people * scale); CHUNK.details = Math.round(CHUNK_BASE.details * scale);
+	CHUNK.cell = Math.max(1, Math.round(CHUNK_BASE.cell * scale)); CHUNK.people = Math.round(CHUNK_BASE.people * scale); CHUNK.details = Math.round(CHUNK_BASE.details * scale); CHUNK.lodTrees = Math.round(CHUNK_BASE.lodTrees * scale);
 }
-// 0: never culled, 1: the world's solid objects (buildings, props, trees), 2: people and vehicles, 3: decals
+// 0: never culled, 1: the world's solid objects (buildings, props, trees), 2: people and vehicles, 3: decals, 4: the stand-ins of distant trees (trees_lod*: a recording on
+// an N100 Chromebook had ~100 of them a frame on a road through hills, more than any other kind)
 function chunkKind(label) {
 	const k = label.indexOf('::'), e = (k > 0 ? label.slice(0, k) : label).toLowerCase();
 	if (/^(terrain|water|sky|cloud|im$|imms|postfx|deferred|lighting|ptfx|ptxgpu|rmptfx|debug|scaleform|radar|rage_|shadow|ssao|hdao|blur|cascade|mirror|billboard|grass|light|spot|point|capsule|tiled|volume|fog|lens|rain|snow|corona|vfx|cubemap|reflect|seethrough|occlu|stencil|copy|clear|downsample|gpu|cs_|directional|distortion|memory|adaptive|avg|damage|distance|dof|exposure|golf|mlaa|silhouette|skinblend|waveform|rope|cable|blend_2lyr)/.test(e)) return 0;
 	if (/terrain|_wet|shadow/.test(e)) return 0;		// the ground (wet ground layers too) and shadow-only geometry
 	if (/^(ped|cloth|vehicle|weapon|hair)/.test(e)) return 2;
+	if (/^trees_lod/.test(e)) return 4;
 	if (/decal/.test(e)) return 3;
 	return 1;
 }
@@ -871,6 +876,7 @@ function chunkCull(vsProg, psProg, inst) {
 	const dx = x - cx, dy = y - cy, d2 = dx * dx + dy * dy;
 	if (kind === 2 && CHUNK.people > 0 && d2 > CHUNK.people * CHUNK.people) return true;
 	if (kind === 3 && CHUNK.details > 0 && d2 > CHUNK.details * CHUNK.details) return true;
+	if (kind === 4 && CHUNK.lodTrees > 0 && d2 > CHUNK.lodTrees * CHUNK.lodTrees) return true;
 	return Math.abs(Math.floor(x / CHUNK.cell) - chunkCam.cx) > 1 || Math.abs(Math.floor(y / CHUNK.cell) - chunkCam.cy) > 1;
 }
 // a water-reflection draw makes its target a reflection (redrawn every REFLECT_EVERY frames from now); anything but the sky or clouds in a water reflection undoes that for good
@@ -1731,6 +1737,7 @@ let shadersReady = 0;		// shader objects whose sources are here (browser: fetche
 let aheadMade = 0, aheadUsed = 0, aheadInFlight = 0;
 let aheadList = [], aheadPos = 0, aheadLater = [], aheadReadyAtPass = -1;
 const AHEAD_MAX = isNode ? 1 : Math.max(2, Math.min(8, (self.navigator.hardwareConcurrency || 4) - 1));		// compiles in flight at once (the GPU process compiles them on its threads)
+const AHEAD_PLAY = isNode ? 1 : ((v) => (v === null ? 1 : Math.max(0, Math.min(8, +v | 0))))(new URLSearchParams(self.location.search).get('aheadplay'));		// ... once the world is shown (aheadStep)
 function pipelineRecipe(vsObj, psObj, layout, strides, topoIdx, stripFmt, blendState, dss, rs, rtInfo, dsFormat, roDepth, roStencil) {
 	return {
 		vs: vsObj.hash, ps: psObj ? psObj.hash : '',
@@ -1770,9 +1777,11 @@ function compileAhead(rc, key) {
 function aheadStep() {
 	if (aheadPos >= aheadList.length && !aheadLater.length) return;
 	const t0 = performance.now();
-	// once the world is shown, one compile at a time: each runs on a thread of Chrome's GPU process, and on a 4-thread CPU three at once took cores the game and the GPU
-	// process itself need right then (a story mission loading its people and places)
-	const inFlightMax = worldSent ? 1 : AHEAD_MAX;
+	// once the world is shown, AHEAD_PLAY compiles at a time (1; the page's Fast and Fastest: 0, none): each runs on a thread of Chrome's GPU process, and on a 4-thread CPU
+	// three at once took cores the game and the GPU process itself need right then (a story mission loading its people and places). A pipeline not compiled ahead is
+	// compiled when first drawn, as always (its draws wait a few frames).
+	const inFlightMax = worldSent ? AHEAD_PLAY : AHEAD_MAX;
+	if (!inFlightMax) return;
 	while (aheadInFlight < inFlightMax && performance.now() - t0 < 3) {
 		if (aheadPos >= aheadList.length) {
 			if (!aheadLater.length || aheadReadyAtPass === shadersReady) break;
@@ -3287,31 +3296,30 @@ async function present(id) {
 	}
 	if (CHUNK_AUTO > 0 && CHUNK_BASE.cell > 0) {		// chunks that follow the frame rate (CHUNK_AUTO)
 		const tn = performance.now();
-		if (!chunkWin.t) { chunkWin.t = tn; chunkWin.n = 0; chunkWin.idle = chunkWin.wait = chunkWin.gpu = 0; }
+		if (!chunkWin.t) { chunkWin.t = tn; chunkWin.n = 0; chunkWin.idle = chunkWin.wait = 0; chunkWin.gpu = gpuBusyMs(tn); }
 		else if (++chunkWin.n && tn - chunkWin.t >= 1000) {
-			const n = chunkWin.n, ms = (tn - chunkWin.t) / n, gpu = Math.min(ms, chunkWin.gpu / n);
+			const n = chunkWin.n, ms = (tn - chunkWin.t) / n, busy = gpuBusyMs(tn), gpu = Math.min(ms, (busy - chunkWin.gpu) / n);
 			chunkApplyScale(chunkAdaptStep(chunkScale, ms, gpu, chunkWin.idle / n, CHUNK_AUTO));
-			chunkWin.t = tn; chunkWin.n = 0; chunkWin.idle = chunkWin.wait = chunkWin.gpu = 0;
+			chunkWin.t = tn; chunkWin.n = 0; chunkWin.idle = chunkWin.wait = 0; chunkWin.gpu = busy;
 		}
 	}
 	if (!isNode) {		// the page's FPS counter (index.html, '=' key): presented frames per second, twice a second, and where a frame's time went (per frame): this worker waiting
 		// for the game's commands (idle), waiting for the GPU (wait: a frame slot or a fence), working (the rest: translating draws), and how long the GPU had work (gpu, see gpuTrack)
 		const tn = performance.now();
 		fpsOverlayN++;
-		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.gpu = ov.refl = ov.reflSkip = 0; ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
+		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
 		else if (tn - fpsOverlayT >= 500) {
 			if (!fpsChannel) fpsChannel = new BroadcastChannel('game-fps');
-			if (gpuDoneSeq < gpuSeq) { ov.gpu += tn - gpuBusyT0; gpuBusyT0 = tn; }		// the GPU is still busy: its time so far counts now
-			const n = Math.max(1, fpsOverlayN), ms = (tn - fpsOverlayT) / n;
+			const n = Math.max(1, fpsOverlayN), ms = (tn - fpsOverlayT) / n, busy = gpuBusyMs(tn), gpuPer = (busy - ov.gpu) / n;
 			const byEffect = new Map();
 			for (const pr of ovProgs) { const l = pr.label || '?', k = l.indexOf('::'), e = k > 0 ? l.slice(0, k) : l; byEffect.set(e, (byEffect.get(e) || 0) + pr.ovN); pr.ovN = 0; }
 			ovProgs.length = 0;
 			const top = [...byEffect].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([e, c]) => [e, c / n]);
-			fpsChannel.postMessage({ fps: fpsOverlayN * 1000 / (tn - fpsOverlayT), ms, draws: (drawCount - ov.draws) / n, idle: ov.idle / n, wait: ov.wait / n, pipe: ov.pipe / n, up: ov.up / n, gpu: Math.min(ms, ov.gpu / n),
+			fpsChannel.postMessage({ fps: fpsOverlayN * 1000 / (tn - fpsOverlayT), ms, draws: (drawCount - ov.draws) / n, idle: ov.idle / n, wait: ov.wait / n, pipe: ov.pipe / n, up: ov.up / n, gpu: Math.min(ms, gpuPer),
 				top, refl: ov.refl / n, reflSkip: ov.reflSkip / n, reflEvery: REFLECT_EVERY, merged: (clearsMerged - ov.merged) / n, reused: (packsReused - ov.reused) / n, noop: (noopDraws - ov.noop) / n,
 				culled: (chunkCulled - ov.culled) / n, chunk: CHUNK, chunkAuto: CHUNK_AUTO, chunkActive: chunkFrames > ov.chunkFrames });
 			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames;
-			fpsOverlayN = 0; fpsOverlayT = tn; ov.idle = ov.wait = ov.pipe = ov.up = ov.gpu = ov.refl = ov.reflSkip = 0; ov.draws = drawCount;
+			fpsOverlayN = 0; fpsOverlayT = tn; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = busy; ov.draws = drawCount;
 		}
 	}
 	{	// loading progress for the page (phase3/index.html): first frame, then the world. The world starts with the first frame with a real scene (loading screens draw ~10
