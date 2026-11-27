@@ -141,7 +141,7 @@ let noF32Filter = false, noD32S8 = false, noRG11 = false;
 let mem = null, memBuffer = null, i32 = null, u32 = null, f32 = null, u8 = null, ringBase = 0, ringSize = 0;
 let canvas = null, canvasCtx = null, canvasFormat = null, blit = null, canvasConfigured = false;
 let fpsChannel = null, fpsOverlayN = 0, fpsOverlayT = 0;
-const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0, merged: 0, reused: 0, noop: 0, culled: 0, chunkFrames: 0 };		// merged/reused/noop: the counters' values at the last report		// the frame-rate overlay's sums since its last report (present)
+const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0, merged: 0, reused: 0, noop: 0, culled: 0, chunkFrames: 0, mods: 0, pipes: 0 };		// merged/reused/noop: the counters' values at the last report		// the frame-rate overlay's sums since its last report (present)
 const ovProgs = [];		// the programs drawn since the overlay's last report, each with its count in `ovN` (summed per effect for the report)
 // The GPU's share of a frame (the overlay's "GPU"): the time during which some submitted work is not finished yet, from the submit to the moment this worker learns that the
 // newest submit is done (its event loop gets a turn at least every 2 ms). It includes the GPU process's own work on the commands, so it is a little long, never short.
@@ -158,6 +158,56 @@ function gpuTrack() {
 	});
 }
 function gpuBusyMs(now) { return gpuBusyClosed + (gpuDoneSeq < gpuSeq ? now - gpuBusyT0 : 0); }
+// ---- the graphics chip's own time per pass (timestamp-query) ----------------------------------------------------------------------------------------------------
+// "GPU busy" above runs from a submit until the work is done, Chrome's GPU process handling every command included. To tell that apart from the chip's work, one frame
+// every 2 s (once the world shows) has a timestamp at the start and end of each render pass this worker begins (ensurePass, clears), resolved at its present and read
+// back: the chip's time for the frame, and the passes that took most, named by their targets and the effect of their first draw (the page's overlay shows them).
+// Browsers round the times (Chrome: to 100 us), fine for passes of milliseconds.
+const GPU_TIMING_MAX = 256;		// passes timed in a frame (2 timestamps each)
+const gpuTiming = { set: null, resolve: null, read: null, state: 0, passes: [], cur: null, lastT: 0, result: null };		// state: 0 waiting, 1 timing this frame, 2 reading back
+function gpuTimingInit() {
+	gpuTiming.set = device.createQuerySet({ type: 'timestamp', count: GPU_TIMING_MAX * 2 });
+	gpuTiming.resolve = device.createBuffer({ size: GPU_TIMING_MAX * 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+	gpuTiming.read = device.createBuffer({ size: GPU_TIMING_MAX * 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+}
+function timePass(desc, label) {		// desc gets timestamp writes when this frame is sampled; returns desc
+	if (gpuTiming.state !== 1 || gpuTiming.passes.length >= GPU_TIMING_MAX) return desc;
+	const i = gpuTiming.passes.length;
+	desc.timestampWrites = { querySet: gpuTiming.set, beginningOfPassWriteIndex: i * 2, endOfPassWriteIndex: i * 2 + 1 };
+	gpuTiming.cur = { label, effect: '' };
+	gpuTiming.passes.push(gpuTiming.cur);
+	return desc;
+}
+function gpuTimingResolve() {		// at a sampled frame's present: the timestamps into the read-back buffer; returns how many passes (0: none were timed)
+	const n = gpuTiming.passes.length;
+	gpuTiming.cur = null;
+	if (!n) { gpuTiming.state = 0; gpuTiming.lastT = performance.now(); return 0; }
+	endPass();
+	const enc = getEncoder();
+	enc.resolveQuerySet(gpuTiming.set, 0, n * 2, gpuTiming.resolve, 0);
+	enc.copyBufferToBuffer(gpuTiming.resolve, 0, gpuTiming.read, 0, n * 16);
+	gpuTiming.state = 2;
+	return n;
+}
+function gpuTimingRead(n) {
+	const passes = gpuTiming.passes.slice(0, n);
+	gpuTiming.read.mapAsync(GPUMapMode.READ, 0, n * 16).then(() => {
+		const t = new BigUint64Array(gpuTiming.read.getMappedRange(0, n * 16));
+		const by = new Map();
+		let total = 0;
+		for (let i = 0; i < n; i++) {
+			const a = t[i * 2], b = t[i * 2 + 1];
+			const ms = b > a ? Number(b - a) / 1e6 : 0;
+			if (!(ms < 10000)) continue;		// a pass that did not write both (or a wrapped counter)
+			total += ms;
+			const p = passes[i], key = p.label === 'G-buffer' || p.label === 'clears' || p.label === 'reflections' ? p.label : p.effect || p.label;
+			by.set(key, (by.get(key) || 0) + ms);
+		}
+		gpuTiming.read.unmap();
+		gpuTiming.result = { ms: total, passes: n, top: [...by].sort((x, y) => y[1] - x[1]).slice(0, 4) };
+		gpuTiming.state = 0; gpuTiming.lastT = performance.now();
+	}, () => { gpuTiming.state = 0; gpuTiming.lastT = performance.now(); });
+}
 let encoder = null, pass = null, passKey = '';
 let errorCount = 0, errorCount0 = 0, clampedDraws = 0, clampedDraws0 = 0, gpuErrorChannel = null;
 const errorKinds = new Map();		// normalised message -> { n, msg }
@@ -682,7 +732,7 @@ async function initDevice(msg) {
 	if (!gpu) throw new Error('no WebGPU');
 	adapter = await gpu.requestAdapter({ powerPreference: 'high-performance' });
 	if (!adapter) throw new Error('no WebGPU adapter');
-	const want = ['texture-compression-bc', 'texture-compression-bc-sliced-3d', 'depth32float-stencil8', 'float32-filterable', 'indirect-first-instance', 'rg11b10ufloat-renderable', 'bgra8unorm-storage', 'depth-clip-control', 'clip-distances', 'texture-formats-tier1', 'dual-source-blending'];
+	const want = ['texture-compression-bc', 'texture-compression-bc-sliced-3d', 'depth32float-stencil8', 'float32-filterable', 'indirect-first-instance', 'rg11b10ufloat-renderable', 'bgra8unorm-storage', 'depth-clip-control', 'clip-distances', 'texture-formats-tier1', 'dual-source-blending', 'timestamp-query'];
 	const requiredFeatures = want.filter((f) => adapter.features.has(f));
 	const limits = {};
 	for (const k of ['maxBufferSize', 'maxStorageBufferBindingSize', 'maxUniformBufferBindingSize', 'maxTextureDimension2D', 'maxTextureArrayLayers',
@@ -700,6 +750,7 @@ async function initDevice(msg) {
 	noF32Filter = !device.features.has('float32-filterable');
 	noD32S8 = !device.features.has('depth32float-stencil8');
 	noRG11 = !device.features.has('rg11b10ufloat-renderable');
+	if (!isNode && device.features.has('timestamp-query')) gpuTimingInit();
 	const lacking = want.filter((f) => !device.features.has(f));
 	if (lacking.length) logLine('this device lacks: ' + lacking.join(', ') + (noF32Filter || noD32S8 || noRG11 ? ' (worked around: ' + [noF32Filter && '32-bit float textures filtered through 16-bit copies', noD32S8 && '24-bit depth', noRG11 && 'rgba16float HDR targets'].filter(Boolean).join(', ') + ')' : ''));
 	if (!isNode) {
@@ -795,7 +846,7 @@ const REFLECT_EVERY = isNode ? +(process.env.WGPU_REFLECT_EVERY || 1) : Math.max
 // Anything else is drawn as before.
 const CHUNK = (() => {
 	const v = (isNode ? process.env.WGPU_CHUNK || '' : new URLSearchParams(self.location.search).get('chunk') || '').split(',').map((x) => Math.max(0, +x || 0));
-	return { cell: v[0] || 0, people: v[1] || 0, details: v[2] || 0, lodTrees: v[3] || 0 };
+	return { cell: v[0] || 0, people: v[1] || 0, details: v[2] || 0, lodTrees: v[3] || 0, trees: v[4] || 0, glass: v[5] || 0 };
 })();
 const chunkCam = { frame: -1, x: 0, y: 0, cx: 0, cy: 0 };
 let chunkCulled = 0;
@@ -804,7 +855,7 @@ let chunkCulled = 0;
 // game's own threads are what holds the frame rate: this worker waiting for their commands half the frame or more with the GPU side mostly free (fewer draws would not help).
 // (A rule that only shrank when one part was busy 70 % of the frame never fired on a 4-thread CPU, where the game's threads, this worker and the GPU process share the cores.)
 const CHUNK_AUTO = isNode ? 0 : Math.max(0, +(new URLSearchParams(self.location.search).get('chunkauto') || 0));
-const CHUNK_BASE = { cell: CHUNK.cell, people: CHUNK.people, details: CHUNK.details, lodTrees: CHUNK.lodTrees }, CHUNK_MIN_SCALE = 0.4, CHUNK_MAX_SCALE = 2;
+const CHUNK_BASE = { ...CHUNK }, CHUNK_MIN_SCALE = 0.4, CHUNK_MAX_SCALE = 2;
 let chunkScale = 1;
 const chunkWin = { t: 0, n: 0, idle: 0, wait: 0, gpu: 0 };		// this second's frames (present)
 function chunkAdaptStep(scale, ms, gpu, idle, target) {
@@ -815,16 +866,20 @@ function chunkAdaptStep(scale, ms, gpu, idle, target) {
 }
 function chunkApplyScale(scale) {
 	chunkScale = scale;
-	CHUNK.cell = Math.max(1, Math.round(CHUNK_BASE.cell * scale)); CHUNK.people = Math.round(CHUNK_BASE.people * scale); CHUNK.details = Math.round(CHUNK_BASE.details * scale); CHUNK.lodTrees = Math.round(CHUNK_BASE.lodTrees * scale);
+	for (const k in CHUNK_BASE) CHUNK[k] = Math.round(CHUNK_BASE[k] * scale);
+	CHUNK.cell = Math.max(1, CHUNK.cell);
 }
-// 0: never culled, 1: the world's solid objects (buildings, props, trees), 2: people and vehicles, 3: decals, 4: the stand-ins of distant trees (trees_lod*: a recording on
-// an N100 Chromebook had ~100 of them a frame on a road through hills, more than any other kind)
+// 0: never culled, 1: the world's solid objects (buildings, props), 2: people and vehicles, 3: decals, 4: the stand-ins of distant trees (trees_lod*: a recording on
+// an N100 Chromebook had ~100 of them a frame on a road through hills, more than any other kind), 5: trees (alpha-tested leaves: costly on small GPUs), 6: see-through
+// glass and fences of the world (blended or alpha-tested). Kinds 4-6 with a distance of 0 are culled like kind 1.
 function chunkKind(label) {
 	const k = label.indexOf('::'), e = (k > 0 ? label.slice(0, k) : label).toLowerCase();
 	if (/^(terrain|water|sky|cloud|im$|imms|postfx|deferred|lighting|ptfx|ptxgpu|rmptfx|debug|scaleform|radar|rage_|shadow|ssao|hdao|blur|cascade|mirror|billboard|grass|light|spot|point|capsule|tiled|volume|fog|lens|rain|snow|corona|vfx|cubemap|reflect|seethrough|occlu|stencil|copy|clear|downsample|gpu|cs_|directional|distortion|memory|adaptive|avg|damage|distance|dof|exposure|golf|mlaa|silhouette|skinblend|waveform|rope|cable|blend_2lyr)/.test(e)) return 0;
 	if (/terrain|_wet|shadow/.test(e)) return 0;		// the ground (wet ground layers too) and shadow-only geometry
 	if (/^(ped|cloth|vehicle|weapon|hair)/.test(e)) return 2;
 	if (/^trees_lod/.test(e)) return 4;
+	if (/^trees/.test(e)) return 5;
+	if (/^(glass|cutout_fence)/.test(e)) return 6;
 	if (/decal/.test(e)) return 3;
 	return 1;
 }
@@ -877,6 +932,8 @@ function chunkCull(vsProg, psProg, inst) {
 	if (kind === 2 && CHUNK.people > 0 && d2 > CHUNK.people * CHUNK.people) return true;
 	if (kind === 3 && CHUNK.details > 0 && d2 > CHUNK.details * CHUNK.details) return true;
 	if (kind === 4 && CHUNK.lodTrees > 0 && d2 > CHUNK.lodTrees * CHUNK.lodTrees) return true;
+	if (kind === 5 && CHUNK.trees > 0 && d2 > CHUNK.trees * CHUNK.trees) return true;
+	if (kind === 6 && CHUNK.glass > 0 && d2 > CHUNK.glass * CHUNK.glass) return true;
 	return Math.abs(Math.floor(x / CHUNK.cell) - chunkCam.cx) > 1 || Math.abs(Math.floor(y / CHUNK.cell) - chunkCam.cy) > 1;
 }
 // a water-reflection draw makes its target a reflection (redrawn every REFLECT_EVERY frames from now); anything but the sky or clouds in a water reflection undoes that for good
@@ -1049,15 +1106,18 @@ function resetState() {
 
 function viewFormat(dxgi, tex) { return dxgi ? mapFormat(dxgi, 0).format : tex.format; }
 
+// A 3D texture is rendered into one depth slice at a time: a 3d view of the mip and the attachment's depthSlice (WebGPU has no 2d view of a 3D texture; the view this made
+// before, a 2d one or a 3d one at an array layer, was rejected: clears and draws into 3D targets were lost with a validation error)
 function targetView(t, dxgi, mip, slice, dimension) {
-	const fmt = viewFormat(dxgi, t);
-	const key = fmt + '|' + mip + '|' + slice;
+	const fmt = viewFormat(dxgi, t), is3d = t.desc.dimension === '3d';
+	const key = fmt + '|' + mip + '|' + (is3d ? '3d' : slice);
 	let v = t.views.get(key);
 	if (!v) {
-		v = t.tex.createView({ format: fmt, baseMipLevel: mip, mipLevelCount: 1, baseArrayLayer: slice, arrayLayerCount: 1, dimension: t.desc.dimension === '3d' ? '3d' : '2d' });
+		v = is3d ? t.tex.createView({ format: fmt, baseMipLevel: mip, mipLevelCount: 1, dimension: '3d' })
+			: t.tex.createView({ format: fmt, baseMipLevel: mip, mipLevelCount: 1, baseArrayLayer: slice, arrayLayerCount: 1, dimension: '2d' });
 		t.views.set(key, v);
 	}
-	return { view: v, format: fmt };
+	return { view: v, format: fmt, depthSlice: is3d ? slice : undefined };
 }
 
 // ---- uniform ring: constant buffers are copied per draw (D3D11 semantics) and bound with dynamic offsets ----------------------------------
@@ -1854,6 +1914,7 @@ function ensurePass() {
 		if (!t) { colorAttachments.push(null); rtInfo.push(null); continue; }
 		const v = targetView(t, r.fmt, r.mip, r.slice);
 		const att = { view: v.view, loadOp: 'load', storeOp: 'store' };
+		if (v.depthSlice !== undefined) att.depthSlice = v.depthSlice;
 		if (pendingClears.length) takeColorClear(att, r.tex, r.mip, r.slice, v.format, t);
 		colorAttachments.push(att);
 		markColorDirty(t);
@@ -1888,6 +1949,10 @@ function ensurePass() {
 	rtInfo.samples = samples;
 	passKey = key;
 	pdirty = true;
+	if (gpuTiming.state === 1) {
+		const t0 = S.rt[0].tex ? objs.get(S.rt[0].tex) : null;
+		timePass(desc, colorAttachments.length >= 3 ? 'G-buffer' : t0 && t0.reflect ? 'reflections' : (rtInfo[0] ? rtInfo[0].format : 'depth') + ' ' + passW + 'x' + passH);
+	}
 	pass = getEncoder().beginRenderPass(desc);
 	beginOcclusionInPass();
 	passInfo = { rtInfo, dsFormat, colorCount: colorAttachments.length, roDepth: !!dt && (S.ds.flags & 1) !== 0, roStencil: !!dt && (S.ds.flags & 2) !== 0, width: passW, height: passH };
@@ -2294,6 +2359,7 @@ function doDraw(p) {
 	}
 	drawCount++;
 	{ const ep = psProg || vsProg; if (ep.ovN) ep.ovN++; else { ep.ovN = 1; ovProgs.push(ep); } }		// the overlay's draws per effect
+	if (gpuTiming.cur && !gpuTiming.cur.effect) { const l = (psProg || vsProg).label || '', k = l.indexOf('::'); gpuTiming.cur.effect = k > 0 ? l.slice(0, k) : l; }
 	if (nanHuntState === 2) { nanHuntLabel = vsProg.label + ' + ' + (psProg ? psProg.label : '-') + ' (draw ' + drawCount + ')'; nanHuntPs = psProg; nanHuntVs = vsProg; }
 	if (shotEvery || shotAllRt) {
 		const t0 = S.rt[0].tex ? objs.get(S.rt[0].tex) : null;
@@ -2879,10 +2945,7 @@ async function readback(p) {
 
 // ---- clears (own passes) ------------------------------------------------------------------------------------------------------------
 // views for clears come from the same per-texture cache as render-target views (a new GPUTextureView per clear before)
-function clearView(t, mip, slice) {
-	if (t.desc.dimension === '3d') return t.tex.createView({ baseMipLevel: mip, mipLevelCount: 1, baseArrayLayer: slice, arrayLayerCount: 1, dimension: '2d' });
-	return targetView(t, 0, mip, slice).view;
-}
+function clearView(t, mip, slice) { return targetView(t, 0, mip, slice).view; }
 function clearRT(id, mip, slice, r, g, b, a) {
 	const t = objs.get(id);
 	if (!t || t.kind !== 'texture') return;
@@ -2924,11 +2987,11 @@ function runClear(c) {		// the clear as its own pass
 	if (objs.get(c.id) !== t) return;		// destroyed meanwhile
 	clearsRun++;
 	const view = clearView(t, c.mip, c.slice);
-	if (!c.depth) getEncoder().beginRenderPass({ colorAttachments: [{ view, loadOp: 'clear', storeOp: 'store', clearValue: c.color }] }).end();
+	if (!c.depth) getEncoder().beginRenderPass(timePass({ colorAttachments: [Object.assign({ view, loadOp: 'clear', storeOp: 'store', clearValue: c.color }, t.desc.dimension === '3d' ? { depthSlice: c.slice } : null)] }, 'clears')).end();
 	else {
 		const att = { view, depthLoadOp: (c.flags & 1) ? 'clear' : 'load', depthStoreOp: 'store', depthClearValue: c.depthValue };
 		if (hasStencil(t.format)) Object.assign(att, { stencilLoadOp: (c.flags & 2) ? 'clear' : 'load', stencilStoreOp: 'store', stencilClearValue: c.stencil });
-		getEncoder().beginRenderPass({ colorAttachments: [], depthStencilAttachment: att }).end();
+		getEncoder().beginRenderPass(timePass({ colorAttachments: [], depthStencilAttachment: att }, 'clears')).end();
 	}
 	usedInEncoder.add(t);
 }
@@ -3307,7 +3370,7 @@ async function present(id) {
 		// for the game's commands (idle), waiting for the GPU (wait: a frame slot or a fence), working (the rest: translating draws), and how long the GPU had work (gpu, see gpuTrack)
 		const tn = performance.now();
 		fpsOverlayN++;
-		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
+		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
 		else if (tn - fpsOverlayT >= 500) {
 			if (!fpsChannel) fpsChannel = new BroadcastChannel('game-fps');
 			const n = Math.max(1, fpsOverlayN), ms = (tn - fpsOverlayT) / n, busy = gpuBusyMs(tn), gpuPer = (busy - ov.gpu) / n;
@@ -3317,8 +3380,10 @@ async function present(id) {
 			const top = [...byEffect].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([e, c]) => [e, c / n]);
 			fpsChannel.postMessage({ fps: fpsOverlayN * 1000 / (tn - fpsOverlayT), ms, draws: (drawCount - ov.draws) / n, idle: ov.idle / n, wait: ov.wait / n, pipe: ov.pipe / n, up: ov.up / n, gpu: Math.min(ms, gpuPer),
 				top, refl: ov.refl / n, reflSkip: ov.reflSkip / n, reflEvery: REFLECT_EVERY, merged: (clearsMerged - ov.merged) / n, reused: (packsReused - ov.reused) / n, noop: (noopDraws - ov.noop) / n,
-				culled: (chunkCulled - ov.culled) / n, chunk: CHUNK, chunkAuto: CHUNK_AUTO, chunkActive: chunkFrames > ov.chunkFrames });
-			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames;
+				culled: (chunkCulled - ov.culled) / n, chunk: CHUNK, chunkAuto: CHUNK_AUTO, chunkActive: chunkFrames > ov.chunkFrames, chip: gpuTiming.result,
+				// shader modules and pipelines made per second: each is compiled by Chrome's GPU process (shown there only as "GPU busy"), many while new places stream in
+				newShaders: (shaderModuleCount - ov.mods) * 1000 / (tn - fpsOverlayT), newPipelines: (pipeCreates + aheadMade - ov.pipes) * 1000 / (tn - fpsOverlayT) });
+			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade;
 			fpsOverlayN = 0; fpsOverlayT = tn; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = busy; ov.draws = drawCount;
 		}
 	}
@@ -3369,7 +3434,10 @@ async function present(id) {
 		await screenshot(id, shotPrefix + String(presentCount).padStart(6, '0') + '.png');
 		for (const tid of (isNode ? process.env.WGPU_SHOT_TEXS || '' : '').split(',').filter(Boolean)) await screenshot(+tid, shotPrefix + 'tex' + tid + '_' + String(presentCount).padStart(6, '0') + '.png');
 	}
+	const timedRead = gpuTiming.state === 1 ? gpuTimingResolve() : 0;		// a sampled frame's pass times: resolved with this frame's last commands
 	flush('present');
+	if (timedRead) gpuTimingRead(timedRead);
+	if (gpuTiming.state === 0 && gpuTiming.set && worldSent && performance.now() - gpuTiming.lastT >= 2000) { gpuTiming.state = 1; gpuTiming.passes.length = 0; gpuTiming.cur = null; }		// the next frame is sampled
 	frameSlotDone[ubo.slot] = device.queue.onSubmittedWorkDone();
 	ubo.slot = (ubo.slot + 1) % FRAME_SLOTS; ubo.chunk = 0; ubo.off = 0; ubo.frame++;
 	const tw0 = performance.now();
