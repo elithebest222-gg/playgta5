@@ -451,7 +451,8 @@ function startProgress() {
 function fpsDetail(d) {
 	const ms = (x) => (x < 10 ? x.toFixed(1) : Math.round(x)) + ' ms';
 	const work = Math.max(0, d.ms - d.idle - d.wait), gpu = d.gpu || 0;
-	const slowest = gpu >= 0.85 * d.ms ? 'the graphics chip (Graphics: Fastest helps most)' : work >= 0.8 * d.ms ? 'translating draws (CPU)' : 'the game\'s threads (CPU)';
+	// "GPU busy" is the time from a submit until the work is done: Chrome's GPU process handling every draw (a CPU cost per draw) and the graphics chip's own work
+	const slowest = gpu >= 0.85 * d.ms ? 'the graphics side (Chrome\'s GPU process and the chip: fewer draws or pixels help)' : work >= 0.8 * d.ms ? 'translating draws (CPU)' : 'the game\'s threads (CPU)';
 	const extra = [d.pipe >= 1 && 'compiling shaders ' + ms(d.pipe), d.up >= 1 && 'uploads ' + ms(d.up)].filter(Boolean).join(' · ');
 	// what the draws are (the shader effect: ped, vehicle_*, trees*, normal*... = buildings and props, im = blits and UI, ...) and the reflection cube map's share
 	const top = (d.top || []).filter((x) => x[1] >= 1).map((x) => x[0] + ' ' + Math.round(x[1])).join(' · ');
@@ -503,21 +504,71 @@ addEventListener('pagehide', () => { try { new BroadcastChannel('game-io').postM
 // Chosen on the setup screen (remembered), or ?quality=fast|balanced|full. The engine settings are the ones the port's own low-memory profile uses (measured there in a
 // Node run at the world: the cascade shadow pass was a third of all draws, and a 4-core Chromebook's GPU worker spent ~110 us per draw), so Fast mostly cuts the number
 // of draws; the render scale cuts the pixels. Nothing here touches shader quality: its low setting selects shaders (win32_40_lq) this port has no translation of.
+// The lowest world the game's own settings allow: distance scaling, population density and variety, ped and vehicle detail at their minimum, no shadows (-shadowQuality=-1,
+// below the menu's lowest), the simplest reflections, particles and grass, quarter-size textures; and the post effects with a command-line switch at their lowest too
+// (-postFX=0: Normal, which also keeps the bokeh depth of field away: its geometry shader cannot be translated to WebGPU; water Normal; anisotropic filtering off).
 const LOW_ARGS = () => ['-textureQuality=0', '-pedVariety=0', '-vehicleVariety=0', '-shadowQuality=' + (q.get('shadows') === '1' ? 0 : -1), '-reflectionQuality=0', '-particleQuality=0',
-	'-grassQuality=0', '-cityDensity=0', '-lodScale=0', '-pedLodBias=0', '-vehicleLodBias=0'];
+	'-grassQuality=0', '-cityDensity=0', '-lodScale=0', '-pedLodBias=0', '-vehicleLodBias=0', '-postFX=0', '-waterQuality=0', '-anisotropicQualityLevel=0'];
+// Fastest, Fast and Balanced differ only in resolution: the same lowest world, effects off (EFFECTS_OFF) and reflections redrawn every 30th frame (wgpu_worker.js REFLECT_EVERY).
+// On a 4-thread Chromebook (Intel N100) the frame time is set mostly by the number of draws (~1,100 at the lowest settings), not by pixels: resolution buys some frames, not all.
 const QUALITY = {
-	fastest: { label: 'Fastest', scale: 0.5, cap: [960, 540], fewerThreads: true, args: LOW_ARGS, reflect: 4,
-		about: 'Half resolution (blurry), with the Fast settings. The most frames, when the graphics chip is the slowest part (the = key shows that in the game).' },
-	fast: { label: 'Fast', scale: 0.7, cap: [1280, 720], fewerThreads: true, args: LOW_ARGS, reflect: 4,
-		about: '70 % resolution (at most 1280x720), no shadows, fewer people and cars, shorter draw distance, lower texture detail, reflections redrawn every 4th frame. For Chromebooks and older computers.' },
-	balanced: { label: 'Balanced', scale: 0.85, cap: [1920, 1080], fewerThreads: false, args: () => ['-shadowQuality=0', '-reflectionQuality=0', '-particleQuality=0', '-grassQuality=0', '-cityDensity=0', '-lodScale=0'],
-		about: '85 % resolution, the simplest shadows, no reflections, fewer people and cars, full textures. For most laptops.' },
-	full: { label: 'Full', scale: 1, cap: [3840, 2160], fewerThreads: false, args: () => [],
-		about: 'Native resolution and the game\'s own default settings. For gaming PCs.' },
+	fastest: { label: 'Fastest', scale: 0.35, cap: [960, 540], args: LOW_ARGS, reflect: 30, effectsOff: true,
+		about: '35 % resolution (very blurry), the lowest world and effects. A fallback for the weakest graphics chips.' },
+	fast: { label: 'Fast', scale: 0.45, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true,
+		about: '45 % resolution, the lowest world and effects.' },
+	balanced: { label: 'Balanced', scale: 0.58, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true,
+		about: '58 % resolution. No shadows, ambient occlusion, depth of field, motion blur or anti-aliasing; reflections redrawn every 30th frame; fewest people and cars, shortest draw distance, lower texture detail. For Chromebooks and laptops.' },
+	full: { label: 'Full', scale: 1, cap: [3840, 2160], args: () => [], reflect: 1, effectsOff: false,
+		about: 'Native resolution and the game\'s own settings (effects the other presets turned off come back). For gaming PCs.' },
 };
-// The device's default: Fast on a Chromebook or with 4 GB or less, Balanced with 4 or fewer CPU threads, Full otherwise
-const QUALITY_DEFAULT = /\bCrOS\b/.test(navigator.userAgent) || (navigator.deviceMemory && navigator.deviceMemory <= 4) ? 'fast' : navigator.hardwareConcurrency <= 4 ? 'balanced' : 'full';
+// The device's default: Balanced on a Chromebook or with 4 or fewer CPU threads (the low-memory profile, 4 GB or less, always runs Fast), Full otherwise
+const QUALITY_DEFAULT = /\bCrOS\b/.test(navigator.userAgent) || navigator.hardwareConcurrency <= 4 || (navigator.deviceMemory && navigator.deviceMemory <= 4) ? 'balanced' : 'full';
 let quality = QUALITY[q.get('quality')] ? q.get('quality') : (() => { try { const v = localStorage.getItem('gta5-quality'); return QUALITY[v] ? v : QUALITY_DEFAULT; } catch (e) { return QUALITY_DEFAULT; } })();
+// Low-memory profile (?low=1 forces it, ?low=0 forbids it; default: navigator.deviceMemory <= 4, which browsers report as 4 for 4 GB and less)
+const isLowMemory = () => { const v = q.get('low'); return v === '1' || (v !== '0' && !!navigator.deviceMemory && navigator.deviceMemory <= 4); };
+// The game's screen effects that have no command-line switch, turned off in its own settings file (the one the game writes to /userdata/Documents, kept in IndexedDB
+// 'gta5-userdata' by io_worker.js) before the engine reads it: only values of elements that are there are changed, the originals are kept aside ('page:settings-original',
+// a key the game never sees) and Full puts them back. Nothing happens before the game has written its settings file (its first start).
+const EFFECTS_OFF = { SSAO: '0', PostFX: '0', DoF: 'false', MotionBlurStrength: '0.000000', FXAA_Enabled: 'false', TXAA_Enabled: 'false', MSAA: '0', MSAAFragments: '0', MSAAQuality: '0',
+	ReflectionMSAA: '0', Lighting_FogVolumes: 'false', Reflection_MipBlur: 'false', Shadow_SoftShadows: '0', Shadow_ParticleShadows: 'false', Shadow_LongShadows: 'false',
+	UltraShadows_Enabled: 'false', AnisotropicFiltering: '0', Tessellation: '0', WaterQuality: '0', HdStreamingInFlight: 'false', MaxLodScale: '0.000000', Shader_SSA: 'false' };
+function tuneGameSettings(off) {
+	const elRe = (name) => new RegExp('(<' + name + '\\s+value=")([^"]*)(")');
+	const req = (r) => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+	const work = (async () => {
+		if (typeof indexedDB === 'undefined') return 'no IndexedDB';
+		const open = indexedDB.open('gta5-userdata', 1);
+		open.onupgradeneeded = () => open.result.createObjectStore('files');
+		const db = await req(open);
+		try {
+			const store = () => db.transaction('files', 'readwrite').objectStore('files');
+			const keys = await req(store().getAllKeys());
+			const key = keys.find((k) => typeof k === 'string' && /^\/userdata\/.*\/settings\.xml$/i.test(k));
+			if (!key) return 'no settings file yet (the game writes it on its first start)';
+			const rec = await req(store().get(key)), backup = await req(store().get('page:settings-original'));
+			if (!rec || !rec.data) return 'settings file empty';
+			let text = new TextDecoder().decode(rec.data);
+			const changed = [];
+			if (off) {
+				const orig = backup && backup.values ? backup.values : {};
+				for (const [name, v] of Object.entries(EFFECTS_OFF)) {
+					text = text.replace(elRe(name), (m, a, cur, c) => { if (cur === v) return m; if (!(name in orig)) orig[name] = cur; changed.push(name); return a + v + c; });
+				}
+				if (!changed.length) return 'effects already off';
+				await req(store().put({ values: orig }, 'page:settings-original'));
+			} else {
+				if (!backup || !backup.values) return 'nothing to restore';
+				for (const [name, v] of Object.entries(backup.values)) text = text.replace(elRe(name), (m, a, cur, c) => { if (cur !== v) changed.push(name); return a + v + c; });
+				await req(store().delete('page:settings-original'));
+				if (!changed.length) return 'settings already as they were';
+			}
+			await req(store().put({ data: new TextEncoder().encode(text), mtime: rec.mtime }, key));
+			return (off ? 'turned off in ' : 'put back in ') + key + ': ' + changed.join(', ');
+		} finally { db.close(); }
+	})();
+	// never holds the start up for long: a blocked or broken IndexedDB only costs the effects
+	return Promise.race([work, new Promise((res) => setTimeout(() => res('timed out'), 3000))]).catch((e) => 'failed: ' + (e && e.message || e));
+}
 let lowMemory = false;		// set in startEngine (module scope: the ?mem readout also needs it)
 let startSize = [1280, 720], wantSize = null;		// set in startEngine (module scope: installInput uses them)
 // The engine itself: `local` is what loader.js needs to read the game from the player's folder (see prepareFolder).
@@ -529,14 +580,14 @@ function startEngine(local) {
 	// variety, city density, LOD and quality settings: measured in a Node run at the world, GPU memory 1.16 GB -> 0.5 GB and streamed assets 1.38 GB -> 0.95 GB.
 	// Shadows off (-shadowQuality=-1, engine level 0 below the menu's lowest; SettingsManager.cpp, wasm): the cascade shadow pass was a third of all draws (Node, 1366x600:
 	// 600-900 of 1,300-2,900 per frame), and a 4-core Chromebook spent ~110 us per draw. ?shadows=1 keeps them at the lowest level.
-	const lowParam = q.get('low');
-	lowMemory = lowParam === '1' || (lowParam !== '0' && navigator.deviceMemory && navigator.deviceMemory <= 4);
+	lowMemory = isLowMemory();
 	// The graphics preset (setup screen; ?quality=fast|balanced|full). The low-memory profile is Fast with its memory limits.
 	const preset = QUALITY[lowMemory ? 'fast' : quality];
 	const QUALITY_ARGS = lowMemory ? LOW_ARGS() : preset.args();
 	// Fewer engine threads on a CPU with 4 or fewer: the engine sizes its worker pools from the core count, and on a Chromebook those threads compete with the main
 	// thread and the GPU worker, which set the frame rate (in the low-memory profile, 2 cores = 54 threads instead of 80-116, ~20 MB each)
-	const cores = +(q.get('cores') || 0) || (lowMemory || (preset.fewerThreads && navigator.hardwareConcurrency <= 4) ? 2 : navigator.hardwareConcurrency);
+	// On a 4-thread CPU (Intel N100) the engine gets 2 cores whatever the preset: its job threads then leave the other two to the GPU worker, the GPU process and the page.
+	const cores = +(q.get('cores') || 0) || (lowMemory || navigator.hardwareConcurrency <= 4 ? 2 : navigator.hardwareConcurrency);
 	if (lowMemory) hud.textContent = 'Low-memory device (' + (navigator.deviceMemory || '?') + ' GB reported): close other tabs. If the tab shows "Aw, Snap!" or SIGILL it ran out of memory.';
 	postLog('[page env] ' + JSON.stringify({ deviceMemory: navigator.deviceMemory, cores: navigator.hardwareConcurrency, usingCores: cores, low: lowMemory, quality: preset.label, isolated: crossOriginIsolated, ua: navigator.userAgent.slice(0, 120), screen: screen.width + 'x' + screen.height + '@' + devicePixelRatio }));
 	// Back buffer = the browser window in device pixels times the preset's scale (Full: native resolution), following window resizes live (see installInput); the canvas
@@ -1234,7 +1285,8 @@ function startGame(prep) {
 	$('loading').hidden = false;
 	startTitle();
 	startProgress();
-	startEngine(prep.local);
+	// the game's own settings file first (EFFECTS_OFF): the engine reads it at its start
+	tuneGameSettings(QUALITY[isLowMemory() ? 'fast' : quality].effectsOff).then((note) => { console.log('[page] game settings: ' + note); postLog('[page] game settings: ' + note); }).finally(() => startEngine(prep.local));
 }
 anywayBtn.onclick = () => { if (prepared) startGame(prepared); };
 chooseBtn.onclick = async () => {
