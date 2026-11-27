@@ -141,7 +141,7 @@ let noF32Filter = false, noD32S8 = false, noRG11 = false;
 let mem = null, memBuffer = null, i32 = null, u32 = null, f32 = null, u8 = null, ringBase = 0, ringSize = 0;
 let canvas = null, canvasCtx = null, canvasFormat = null, blit = null, canvasConfigured = false;
 let fpsChannel = null, fpsOverlayN = 0, fpsOverlayT = 0;
-const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0, merged: 0, reused: 0, noop: 0 };		// merged/reused/noop: the counters' values at the last report		// the frame-rate overlay's sums since its last report (present)
+const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0, merged: 0, reused: 0, noop: 0, culled: 0 };		// merged/reused/noop: the counters' values at the last report		// the frame-rate overlay's sums since its last report (present)
 const ovProgs = [];		// the programs drawn since the overlay's last report, each with its count in `ovN` (summed per effect for the report)
 // The GPU's share of a frame (the overlay's "GPU"): the time during which some submitted work is not finished yet, from the submit to the moment this worker learns that the
 // newest submit is done (its event loop gets a turn at least every 2 ms). It includes the GPU process's own work on the commands, so it is a little long, never short.
@@ -781,6 +781,59 @@ function createTexture(id, dim, w, h, d, mips, arraySize, dxgi, bind, samples) {
 // The water's mirrored view (the scenery drawn with the shaders' *WaterReflection techniques into a target of its own) the same way: a target becomes a reflection when a
 // water-reflection draw goes into it, and stops being one for good when anything else but the sky and clouds is drawn into it (a target shared with another pass).
 const REFLECT_EVERY = isNode ? +(process.env.WGPU_REFLECT_EVERY || 1) : Math.max(1, Math.min(60, +(new URLSearchParams(self.location.search).get('reflect') || 1) | 0));
+// ---- chunks: only the world near the camera is drawn ------------------------------------------------------------------------------------------------------
+// The game streams and draws its world by its own rules (already at their lowest), and every draw costs about the same here and in Chrome's GPU process however far away or
+// small it is. With chunks on (the page's Balanced, Fast and Fastest; ?chunk=cell,people,details in metres, 0 = off) the map is a grid of square cells of `cell` metres and only
+// the 3x3 cells around the camera are drawn: a solid object of the world in any other cell is not drawn at all, and people and vehicles (each a dozen draws or more) farther than
+// `people` metres and decals (dirt, graffiti, tyre marks) farther than `details` are not either. The ground, water, sky, lights and effects are always drawn, so the land
+// stays to the horizon. Only draws of the G-buffer pass (3 or more colour targets) are looked at, and only when the vertex constants at register b1 hold the game's matrices
+// (rage_matrices: gWorld, gWorldView, gWorldViewProj, gViewInverse): the object's and the camera's transforms must both be rigid ones (last column or row 0, 0, 0, 1), the
+// object's must not be the identity (instanced and world-space geometry carry their positions elsewhere), and the camera must be the same as for the frame's other draws.
+// Anything else is drawn as before.
+const CHUNK = (() => {
+	const v = (isNode ? process.env.WGPU_CHUNK || '' : new URLSearchParams(self.location.search).get('chunk') || '').split(',').map((x) => Math.max(0, +x || 0));
+	return { cell: v[0] || 0, people: v[1] || 0, details: v[2] || 0 };
+})();
+const chunkCam = { frame: -1, x: 0, y: 0, cx: 0, cy: 0 };
+let chunkCulled = 0;
+// 0: never culled, 1: the world's solid objects (buildings, props, trees), 2: people and vehicles, 3: decals
+function chunkKind(label) {
+	const k = label.indexOf('::'), e = (k > 0 ? label.slice(0, k) : label).toLowerCase();
+	if (/^(terrain|water|sky|cloud|im$|imms|postfx|deferred|lighting|ptfx|ptxgpu|rmptfx|debug|scaleform|radar|rage_|shadow|ssao|hdao|blur|cascade|mirror|billboard|grass|light|spot|point|capsule|tiled|volume|fog|lens|rain|snow|corona|vfx|cubemap|reflect|seethrough|occlu|stencil|copy|clear|downsample|gpu|cs_|directional|distortion|memory|adaptive|avg|damage|distance|dof|exposure|golf|mlaa|silhouette|skinblend|waveform|rope|cable|blend_2lyr)/.test(e)) return 0;
+	if (/terrain|_wet|shadow/.test(e)) return 0;		// the ground (wet ground layers too) and shadow-only geometry
+	if (/^(ped|cloth|vehicle|weapon|hair)/.test(e)) return 2;
+	if (/decal/.test(e)) return 3;
+	return 1;
+}
+// is this draw an object of the world outside the chunks around the camera?
+function chunkCull(vsProg, psProg, inst) {
+	if (inst > 1) return false;
+	let mrt = 0;
+	for (let i = 0; i < 8; i++) if (S.rt[i].tex) mrt++;
+	if (mrt < 3) return false;
+	const prog = psProg || vsProg;
+	const kind = prog.chunkKind !== undefined ? prog.chunkKind : (prog.chunkKind = chunkKind(prog.label || ''));
+	if (!kind) return false;
+	const c = S.cb[0][1], o = c.buf ? objs.get(c.buf) : null;
+	if (!o || !o.shadow || o.size - c.first * 16 < 256) return false;
+	const f = o.shadowF32 || (o.shadowF32 = new Float32Array(o.shadow.buffer, o.shadow.byteOffset, o.shadow.length >> 2));
+	const b = c.first * 4, v = b + 48;
+	let x, y, cx, cy;
+	// row-major (as the game stores them: the translation in the last row) or the transpose
+	if (f[b + 3] === 0 && f[b + 7] === 0 && f[b + 11] === 0 && f[b + 15] === 1) { x = f[b + 12]; y = f[b + 13]; if (x === 0 && y === 0 && f[b + 14] === 0) return false; }
+	else if (f[b + 12] === 0 && f[b + 13] === 0 && f[b + 14] === 0 && f[b + 15] === 1) { x = f[b + 3]; y = f[b + 7]; if (x === 0 && y === 0 && f[b + 11] === 0) return false; }
+	else return false;
+	if (f[v + 3] === 0 && f[v + 7] === 0 && f[v + 11] === 0 && f[v + 15] === 1) { cx = f[v + 12]; cy = f[v + 13]; }
+	else if (f[v + 12] === 0 && f[v + 13] === 0 && f[v + 14] === 0 && f[v + 15] === 1) { cx = f[v + 3]; cy = f[v + 7]; }
+	else return false;
+	if (!(Math.abs(x) < 1e5 && Math.abs(y) < 1e5 && Math.abs(cx) < 1e5 && Math.abs(cy) < 1e5)) return false;		// not a position on the map
+	if (chunkCam.frame !== presentCount) { chunkCam.frame = presentCount; chunkCam.x = cx; chunkCam.y = cy; chunkCam.cx = Math.floor(cx / CHUNK.cell); chunkCam.cy = Math.floor(cy / CHUNK.cell); }
+	else if (Math.abs(cx - chunkCam.x) > 0.05 || Math.abs(cy - chunkCam.y) > 0.05) return false;		// not the frame's main view
+	const dx = x - cx, dy = y - cy, d2 = dx * dx + dy * dy;
+	if (kind === 2 && CHUNK.people > 0 && d2 > CHUNK.people * CHUNK.people) return true;
+	if (kind === 3 && CHUNK.details > 0 && d2 > CHUNK.details * CHUNK.details) return true;
+	return Math.abs(Math.floor(x / CHUNK.cell) - chunkCam.cx) > 1 || Math.abs(Math.floor(y / CHUNK.cell) - chunkCam.cy) > 1;
+}
 // a water-reflection draw makes its target a reflection (redrawn every REFLECT_EVERY frames from now); anything but the sky or clouds in a water reflection undoes that for good
 function waterReflection(t, slice, ps) {
 	const kind = ps.reflKind || (ps.reflKind = /water_?reflection/i.test(ps.label) ? 'water' : /^(sky_system|clouds\w*)::/.test(ps.label) ? 'sky' : 'other');
@@ -2082,6 +2135,7 @@ function doDraw(p) {
 	let vsProg = shaderProgram(vsObj);
 	let psProg = psObj ? shaderProgram(psObj) : null;
 	if (!vsProg || (psObj && !psProg)) { skipDraw('if (!vsProg || (psObj && !psProg)) { skippedDraws++; return;'); return; }
+	if (CHUNK.cell > 0 && kind < 4 && chunkCull(vsProg, psProg, inst)) { chunkCulled++; return; }		// outside the chunks around the camera
 	if (vsProg.overTex || (psProg && psProg.overTex)) {		// more textures than this device allows per stage: a variant for the textures bound now (fitTextures)
 		const vv = vsProg.overTex ? fitTextures(vsObj, vsProg, 0) : null, pv = psProg && psProg.overTex ? fitTextures(psObj, psProg, 1) : null;
 		if ((vsProg.overTex && !vv) || (psProg && psProg.overTex && !pv)) { skipDraw('texture limit'); return; }
@@ -3195,7 +3249,7 @@ async function present(id) {
 		// for the game's commands (idle), waiting for the GPU (wait: a frame slot or a fence), working (the rest: translating draws), and how long the GPU had work (gpu, see gpuTrack)
 		const tn = performance.now();
 		fpsOverlayN++;
-		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.gpu = ov.refl = ov.reflSkip = 0; ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
+		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.gpu = ov.refl = ov.reflSkip = 0; ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
 		else if (tn - fpsOverlayT >= 500) {
 			if (!fpsChannel) fpsChannel = new BroadcastChannel('game-fps');
 			if (gpuDoneSeq < gpuSeq) { ov.gpu += tn - gpuBusyT0; gpuBusyT0 = tn; }		// the GPU is still busy: its time so far counts now
@@ -3205,8 +3259,9 @@ async function present(id) {
 			ovProgs.length = 0;
 			const top = [...byEffect].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([e, c]) => [e, c / n]);
 			fpsChannel.postMessage({ fps: fpsOverlayN * 1000 / (tn - fpsOverlayT), ms, draws: (drawCount - ov.draws) / n, idle: ov.idle / n, wait: ov.wait / n, pipe: ov.pipe / n, up: ov.up / n, gpu: Math.min(ms, ov.gpu / n),
-				top, refl: ov.refl / n, reflSkip: ov.reflSkip / n, reflEvery: REFLECT_EVERY, merged: (clearsMerged - ov.merged) / n, reused: (packsReused - ov.reused) / n, noop: (noopDraws - ov.noop) / n });
-			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws;
+				top, refl: ov.refl / n, reflSkip: ov.reflSkip / n, reflEvery: REFLECT_EVERY, merged: (clearsMerged - ov.merged) / n, reused: (packsReused - ov.reused) / n, noop: (noopDraws - ov.noop) / n,
+				culled: (chunkCulled - ov.culled) / n, chunk: CHUNK });
+			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled;
 			fpsOverlayN = 0; fpsOverlayT = tn; ov.idle = ov.wait = ov.pipe = ov.up = ov.gpu = ov.refl = ov.reflSkip = 0; ov.draws = drawCount;
 		}
 	}
