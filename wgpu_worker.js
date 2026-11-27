@@ -141,7 +141,7 @@ let noF32Filter = false, noD32S8 = false, noRG11 = false;
 let mem = null, memBuffer = null, i32 = null, u32 = null, f32 = null, u8 = null, ringBase = 0, ringSize = 0;
 let canvas = null, canvasCtx = null, canvasFormat = null, blit = null, canvasConfigured = false;
 let fpsChannel = null, fpsOverlayN = 0, fpsOverlayT = 0;
-const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0, merged: 0, reused: 0, noop: 0, culled: 0 };		// merged/reused/noop: the counters' values at the last report		// the frame-rate overlay's sums since its last report (present)
+const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0, merged: 0, reused: 0, noop: 0, culled: 0, chunkFrames: 0 };		// merged/reused/noop: the counters' values at the last report		// the frame-rate overlay's sums since its last report (present)
 const ovProgs = [];		// the programs drawn since the overlay's last report, each with its count in `ovN` (summed per effect for the report)
 // The GPU's share of a frame (the overlay's "GPU"): the time during which some submitted work is not finished yet, from the submit to the moment this worker learns that the
 // newest submit is done (its event loop gets a turn at least every 2 ms). It includes the GPU process's own work on the commands, so it is a little long, never short.
@@ -797,16 +797,17 @@ const CHUNK = (() => {
 const chunkCam = { frame: -1, x: 0, y: 0, cx: 0, cy: 0 };
 let chunkCulled = 0;
 // Chunks that follow the frame rate (?chunkauto=<target frame time in ms>, the page's presets: 33 ms on Balanced): once a second the three distances are scaled together, down
-// (x0.85, to 0.4 of the preset's at least) while the frames take longer than the target and draws set their length (the graphics side or the translation busy most of the
-// frame), back up (x1.08, to twice the preset's at most) while there is room or the game's own threads are what holds the frame rate (fewer draws would not help then).
+// (x0.85, to 0.4 of the preset's at least) while the frames take longer than the target, back up (x1.08, to twice the preset's at most) while there is room, or while the
+// game's own threads are what holds the frame rate: this worker waiting for their commands half the frame or more with the GPU side mostly free (fewer draws would not help).
+// (A rule that only shrank when one part was busy 70 % of the frame never fired on a 4-thread CPU, where the game's threads, this worker and the GPU process share the cores.)
 const CHUNK_AUTO = isNode ? 0 : Math.max(0, +(new URLSearchParams(self.location.search).get('chunkauto') || 0));
 const CHUNK_BASE = { cell: CHUNK.cell, people: CHUNK.people, details: CHUNK.details }, CHUNK_MIN_SCALE = 0.4, CHUNK_MAX_SCALE = 2;
 let chunkScale = 1;
 const chunkWin = { t: 0, n: 0, idle: 0, wait: 0, gpu: 0 };		// this second's frames (present)
-function chunkAdaptStep(scale, ms, gpu, work, target) {
-	const drawBound = gpu >= 0.7 * ms || work >= 0.7 * ms;
-	if (ms > target * 1.08 && drawBound) return Math.max(CHUNK_MIN_SCALE, scale * 0.85);
-	if (ms < target * 0.85 || !drawBound) return Math.min(CHUNK_MAX_SCALE, scale * 1.08);
+function chunkAdaptStep(scale, ms, gpu, idle, target) {
+	const gameBound = idle >= 0.5 * ms && gpu < 0.5 * ms;
+	if (ms > target * 1.08 && !gameBound) return Math.max(CHUNK_MIN_SCALE, scale * 0.85);
+	if (ms < target * 0.85 || gameBound) return Math.min(CHUNK_MAX_SCALE, scale * 1.08);
 	return scale;
 }
 function chunkApplyScale(scale) {
@@ -822,6 +823,27 @@ function chunkKind(label) {
 	if (/decal/.test(e)) return 3;
 	return 1;
 }
+// the object's and the camera's map positions from 64 floats at f[b..] (gWorld at b, gViewInverse at b + 48), or null when they are not two rigid transforms (row-major as
+// the game stores them, the translation in the last row, or the transpose); out = [x, y, cx, cy, identity]
+const chunkPos = [0, 0, 0, 0, 0];
+function chunkMatrices(f, b) {
+	const v = b + 48;
+	if (f[b + 3] === 0 && f[b + 7] === 0 && f[b + 11] === 0 && f[b + 15] === 1) { chunkPos[0] = f[b + 12]; chunkPos[1] = f[b + 13]; chunkPos[4] = f[b + 12] === 0 && f[b + 13] === 0 && f[b + 14] === 0 ? 1 : 0; }
+	else if (f[b + 12] === 0 && f[b + 13] === 0 && f[b + 14] === 0 && f[b + 15] === 1) { chunkPos[0] = f[b + 3]; chunkPos[1] = f[b + 7]; chunkPos[4] = f[b + 3] === 0 && f[b + 7] === 0 && f[b + 11] === 0 ? 1 : 0; }
+	else return false;
+	if (f[v + 3] === 0 && f[v + 7] === 0 && f[v + 11] === 0 && f[v + 15] === 1) { chunkPos[2] = f[v + 12]; chunkPos[3] = f[v + 13]; }
+	else if (f[v + 12] === 0 && f[v + 13] === 0 && f[v + 14] === 0 && f[v + 15] === 1) { chunkPos[2] = f[v + 3]; chunkPos[3] = f[v + 7]; }
+	else return false;
+	return Math.abs(chunkPos[0]) < 1e5 && Math.abs(chunkPos[1]) < 1e5 && Math.abs(chunkPos[2]) < 1e5 && Math.abs(chunkPos[3]) < 1e5;		// positions on the map
+}
+// the floats of the vertex constant buffer at register `slot`, from its bound first constant, or null when fewer than 256 bytes
+function chunkCb(slot) {
+	const c = S.cb[0][slot], o = c.buf ? objs.get(c.buf) : null;
+	if (!o || !o.shadow || o.size - c.first * 16 < 256) return null;
+	chunkCbOff = c.first * 4;
+	return o.shadowF32 || (o.shadowF32 = new Float32Array(o.shadow.buffer, o.shadow.byteOffset, o.shadow.length >> 2));
+}
+let chunkCbOff = 0, chunkFrames = 0;
 // is this draw an object of the world outside the chunks around the camera?
 function chunkCull(vsProg, psProg, inst) {
 	if (inst > 1) return false;
@@ -832,20 +854,19 @@ function chunkCull(vsProg, psProg, inst) {
 	const prog = psProg || vsProg;
 	const kind = prog.chunkKind !== undefined ? prog.chunkKind : (prog.chunkKind = chunkKind(prog.label || ''));
 	if (!kind) return false;
-	const c = S.cb[0][1], o = c.buf ? objs.get(c.buf) : null;
-	if (!o || !o.shadow || o.size - c.first * 16 < 256) return false;
-	const f = o.shadowF32 || (o.shadowF32 = new Float32Array(o.shadow.buffer, o.shadow.byteOffset, o.shadow.length >> 2));
-	const b = c.first * 4, v = b + 48;
-	let x, y, cx, cy;
-	// row-major (as the game stores them: the translation in the last row) or the transpose
-	if (f[b + 3] === 0 && f[b + 7] === 0 && f[b + 11] === 0 && f[b + 15] === 1) { x = f[b + 12]; y = f[b + 13]; if (x === 0 && y === 0 && f[b + 14] === 0) return false; }
-	else if (f[b + 12] === 0 && f[b + 13] === 0 && f[b + 14] === 0 && f[b + 15] === 1) { x = f[b + 3]; y = f[b + 7]; if (x === 0 && y === 0 && f[b + 11] === 0) return false; }
-	else return false;
-	if (f[v + 3] === 0 && f[v + 7] === 0 && f[v + 11] === 0 && f[v + 15] === 1) { cx = f[v + 12]; cy = f[v + 13]; }
-	else if (f[v + 12] === 0 && f[v + 13] === 0 && f[v + 14] === 0 && f[v + 15] === 1) { cx = f[v + 3]; cy = f[v + 7]; }
-	else return false;
-	if (!(Math.abs(x) < 1e5 && Math.abs(y) < 1e5 && Math.abs(cx) < 1e5 && Math.abs(cy) < 1e5)) return false;		// not a position on the map
-	if (chunkCam.frame !== presentCount) { if (mrt < 3) return false; chunkCam.frame = presentCount; chunkCam.x = cx; chunkCam.y = cy; chunkCam.cx = Math.floor(cx / CHUNK.cell); chunkCam.cy = Math.floor(cy / CHUNK.cell); }
+	// the game's matrices: at register b1 (rage_matrices); a vertex shader whose b1 never holds them is searched once at the other registers (another build may bind them
+	// elsewhere), and the register found is kept for it; one with none anywhere after 64 tries is left alone
+	let slot = vsProg.chunkSlot;
+	if (slot === undefined) {
+		const tries = (vsProg.chunkTries = (vsProg.chunkTries || 0) + 1);
+		for (const k of [1, 0, 2, 3, 4, 5, 6, 7]) { const f = chunkCb(k); if (f && chunkMatrices(f, chunkCbOff)) { slot = vsProg.chunkSlot = k; break; } }
+		if (slot === undefined) { if (tries >= 64) vsProg.chunkSlot = -1; return false; }
+	}
+	if (slot < 0) return false;
+	const f = chunkCb(slot);
+	if (!f || !chunkMatrices(f, chunkCbOff) || chunkPos[4]) return false;		// not the matrices this time, or the identity (instanced and world-space geometry)
+	const x = chunkPos[0], y = chunkPos[1], cx = chunkPos[2], cy = chunkPos[3];
+	if (chunkCam.frame !== presentCount) { if (mrt < 3) return false; chunkCam.frame = presentCount; chunkCam.x = cx; chunkCam.y = cy; chunkCam.cx = Math.floor(cx / CHUNK.cell); chunkCam.cy = Math.floor(cy / CHUNK.cell); chunkFrames++; }
 	else if (Math.abs(cx - chunkCam.x) > 0.05 || Math.abs(cy - chunkCam.y) > 0.05) return false;		// not the frame's main view
 	const dx = x - cx, dy = y - cy, d2 = dx * dx + dy * dy;
 	if (kind === 2 && CHUNK.people > 0 && d2 > CHUNK.people * CHUNK.people) return true;
@@ -3268,8 +3289,8 @@ async function present(id) {
 		const tn = performance.now();
 		if (!chunkWin.t) { chunkWin.t = tn; chunkWin.n = 0; chunkWin.idle = chunkWin.wait = chunkWin.gpu = 0; }
 		else if (++chunkWin.n && tn - chunkWin.t >= 1000) {
-			const n = chunkWin.n, ms = (tn - chunkWin.t) / n, gpu = Math.min(ms, chunkWin.gpu / n), work = Math.max(0, ms - (chunkWin.idle + chunkWin.wait) / n);
-			chunkApplyScale(chunkAdaptStep(chunkScale, ms, gpu, work, CHUNK_AUTO));
+			const n = chunkWin.n, ms = (tn - chunkWin.t) / n, gpu = Math.min(ms, chunkWin.gpu / n);
+			chunkApplyScale(chunkAdaptStep(chunkScale, ms, gpu, chunkWin.idle / n, CHUNK_AUTO));
 			chunkWin.t = tn; chunkWin.n = 0; chunkWin.idle = chunkWin.wait = chunkWin.gpu = 0;
 		}
 	}
@@ -3277,7 +3298,7 @@ async function present(id) {
 		// for the game's commands (idle), waiting for the GPU (wait: a frame slot or a fence), working (the rest: translating draws), and how long the GPU had work (gpu, see gpuTrack)
 		const tn = performance.now();
 		fpsOverlayN++;
-		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.gpu = ov.refl = ov.reflSkip = 0; ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
+		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.gpu = ov.refl = ov.reflSkip = 0; ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
 		else if (tn - fpsOverlayT >= 500) {
 			if (!fpsChannel) fpsChannel = new BroadcastChannel('game-fps');
 			if (gpuDoneSeq < gpuSeq) { ov.gpu += tn - gpuBusyT0; gpuBusyT0 = tn; }		// the GPU is still busy: its time so far counts now
@@ -3288,8 +3309,8 @@ async function present(id) {
 			const top = [...byEffect].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([e, c]) => [e, c / n]);
 			fpsChannel.postMessage({ fps: fpsOverlayN * 1000 / (tn - fpsOverlayT), ms, draws: (drawCount - ov.draws) / n, idle: ov.idle / n, wait: ov.wait / n, pipe: ov.pipe / n, up: ov.up / n, gpu: Math.min(ms, ov.gpu / n),
 				top, refl: ov.refl / n, reflSkip: ov.reflSkip / n, reflEvery: REFLECT_EVERY, merged: (clearsMerged - ov.merged) / n, reused: (packsReused - ov.reused) / n, noop: (noopDraws - ov.noop) / n,
-				culled: (chunkCulled - ov.culled) / n, chunk: CHUNK, chunkAuto: CHUNK_AUTO });
-			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled;
+				culled: (chunkCulled - ov.culled) / n, chunk: CHUNK, chunkAuto: CHUNK_AUTO, chunkActive: chunkFrames > ov.chunkFrames });
+			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames;
 			fpsOverlayN = 0; fpsOverlayT = tn; ov.idle = ov.wait = ov.pipe = ov.up = ov.gpu = ov.refl = ov.reflSkip = 0; ov.draws = drawCount;
 		}
 	}

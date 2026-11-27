@@ -456,7 +456,9 @@ function fpsDetail(d) {
 	const extra = [d.pipe >= 1 && 'compiling shaders ' + ms(d.pipe), d.up >= 1 && 'uploads ' + ms(d.up)].filter(Boolean).join(' · ');
 	// what the per-draw savings did this frame: clears that became part of the next pass, constant uploads that matched the last ones, draws that could not touch a pixel
 	const saved = [d.merged >= 1 && Math.round(d.merged) + ' clears folded', d.reused >= 1 && Math.round(d.reused) + ' constants reused', d.noop >= 1 && Math.round(d.noop) + ' empty draws skipped'].filter(Boolean).join(' · ');
-	const chunks = d.chunk && d.chunk.cell > 0 ? 'chunks: 3x3 of ' + d.chunk.cell + ' m' + (d.chunk.people ? ', people and cars ' + d.chunk.people + ' m' : '') + (d.chunkAuto > 0 ? ' (aiming at ' + Math.round(1000 / d.chunkAuto) + ' fps)' : '') + ' · ' + Math.round(d.culled || 0) + ' far draws left out' : '';
+	// chunkActive false: no draw of the frames since the last report had the game's matrices where expected, so nothing could be left out (say so: the numbers would mislead)
+	const chunks = !(d.chunk && d.chunk.cell > 0) ? '' : d.chunkActive === false ? 'chunks: not working here (the game\'s object positions were not found), nothing left out'
+		: 'chunks: 3x3 of ' + d.chunk.cell + ' m' + (d.chunk.people ? ', people and cars ' + d.chunk.people + ' m' : '') + (d.chunkAuto > 0 ? ' (aiming at ' + Math.round(1000 / d.chunkAuto) + ' fps)' : '') + ' · ' + Math.round(d.culled || 0) + ' far draws left out';
 	// what the draws are (the shader effect: ped, vehicle_*, trees*, normal*... = buildings and props, im = blits and UI, ...) and the reflection cube map's share
 	const top = (d.top || []).filter((x) => x[1] >= 1).map((x) => x[0] + ' ' + Math.round(x[1])).join(' · ');
 	const refl = (d.refl || 0) + (d.reflSkip || 0) >= 1 ? 'reflections ' + Math.round(d.refl || 0) + ' drawn' + (d.reflSkip >= 1 ? ', ' + Math.round(d.reflSkip) + ' skipped (each face every ' + d.reflEvery + ' frames)' : '') : '';
@@ -515,7 +517,7 @@ const LOW_ARGS = () => ['-textureQuality=0', '-pedVariety=0', '-vehicleVariety=0
 // Fastest, Fast and Balanced differ only in resolution: the same lowest world, effects off (EFFECTS_OFF) and reflections redrawn every 30th frame (wgpu_worker.js REFLECT_EVERY).
 // On a 4-thread Chromebook (Intel N100) the frame time is set mostly by the number of draws (~1,100 at the lowest settings), not by pixels: resolution buys some frames, not all.
 const QUALITY = {
-	fastest: { label: 'Fastest', scale: 0.35, cap: [960, 540], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '100,60,30', fpsGoal: 50,
+	fastest: { label: 'Fastest', scale: 0.35, cap: [960, 540], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '80,50,25', fpsGoal: 50,
 		about: '35 % resolution (very blurry), the lowest world and effects; the draw distance shrinks or grows to keep about 50 frames per second. A fallback for the weakest graphics chips.' },
 	fast: { label: 'Fast', scale: 0.45, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '120,75,40', fpsGoal: 40,
 		about: '45 % resolution, the lowest world and effects; the draw distance shrinks or grows to keep about 40 frames per second.' },
