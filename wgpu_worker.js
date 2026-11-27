@@ -141,7 +141,7 @@ let noF32Filter = false, noD32S8 = false, noRG11 = false;
 let mem = null, memBuffer = null, i32 = null, u32 = null, f32 = null, u8 = null, ringBase = 0, ringSize = 0;
 let canvas = null, canvasCtx = null, canvasFormat = null, blit = null, canvasConfigured = false;
 let fpsChannel = null, fpsOverlayN = 0, fpsOverlayT = 0, overlayOn = false;		// overlayOn: the page shows the overlay ('=' key): only then are frames timed on the chip (gpuTiming)
-const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0, merged: 0, reused: 0, noop: 0, culled: 0, chunkFrames: 0, mods: 0, pipes: 0, sized: 0, sizedK: 0, hidden: 0, passes: 0, submits: 0, bgs: 0, upBytes: 0, staged: 0, mips: 0, mipsSkipped: 0, kept: null, passDraw: 0, passProxy: 0, passClear: 0 };		// merged/reused/noop: the counters' values at the last report		// the frame-rate overlay's sums since its last report (present)
+const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0, merged: 0, reused: 0, noop: 0, culled: 0, chunkFrames: 0, mods: 0, pipes: 0, sized: 0, sizedK: 0, hidden: 0, passes: 0, submits: 0, bgs: 0, upBytes: 0, staged: 0, mips: 0, mipsSkipped: 0, kept: null, passDraw: 0, passProxy: 0, passClear: 0, wRb: 0, wOcc: 0, wFence: 0, rbN: 0, rbMs: 0 };		// merged/reused/noop: the counters' values at the last report		// the frame-rate overlay's sums since its last report (present)
 const ovProgs = [];		// the programs drawn since the overlay's last report, each with its count in `ovN` (summed per effect for the report)
 // The GPU's share of a frame (the overlay's "GPU"): the time during which some submitted work is not finished yet, from the submit to the moment this worker learns that the
 // newest submit is done (its event loop gets a turn at least every 2 ms). It includes the GPU process's own work on the commands, so it is a little long, never short.
@@ -3100,8 +3100,12 @@ function recordResolves() {
 	enc.copyBufferToBuffer(rb, 0, map, 0, bytes);
 	return { layout, rb, map, size, RU, MU };
 }
+let readbacksInFlight = 0, readbacksDone = 0, readbackMs = 0, resolvesInFlight = 0;
+const waitedOn = { readback: 0, occlusion: 0, fence: 0 };		// ms this worker sat idle while each kind of GPU answer was outstanding (the overlay)
 function mapResolves(res) {
+	resolvesInFlight++;
 	res.map.mapAsync(GPUMapMode.READ).then(() => {
+		resolvesInFlight--;
 		const v = new BigUint64Array(res.map.getMappedRange());
 		const L = res.layout;
 		for (let j = 0; j < L.length; j += 3) {
@@ -3112,13 +3116,27 @@ function mapResolves(res) {
 		}
 		res.map.unmap();
 		releaseBuffer(res.map, res.size, res.MU); releaseBuffer(res.rb, res.size, res.RU);
-	}, () => { res.map.destroy(); res.rb.destroy(); });
+	}, () => { resolvesInFlight--; res.map.destroy(); res.rb.destroy(); });
 }
 // after a submit: complete events once the GPU has caught up
+// The game's GPU fences (D3D11 event queries): it waits on them to pace its frames (a frame or two ahead of the GPU) and before it reuses memory the GPU may still read.
+// Answered when the GPU reported the work done, each wait was a round trip through Chrome's GPU process (everything submitted so far, then the notification back): on a
+// throttled 4-thread Chromebook the game stopped and waited 1-2 times a frame (the overlay's "idle" submits: the game sent nothing while a fence was pending). Here a
+// fence passes when its commands are submitted: every later write of the game's data (queue.writeBuffer/writeTexture, staged copies) is ordered on the queue after
+// the work already submitted, and destroying something still in use waits for the GPU (deferredDestroys; WebGPU itself for submitted work), so nothing the GPU still
+// reads changes under it. How far the game gets ahead is still bounded by this worker's own wait at the present (FRAME_SLOTS frames). ?gpufences=1: answered when the
+// GPU is done, as before (diagnostics).
+const FENCES_AT_SUBMIT = isNode ? process.env.WGPU_GPU_FENCES !== '1' : new URLSearchParams(self.location.search).get('gpufences') !== '1';
+let fencesInFlight = 0;
 function onSubmitted() {
 	if (pendingEvents.length) {
 		const evs = pendingEvents.splice(0);
-		device.queue.onSubmittedWorkDone().then(() => { for (const e of evs) queryStore(e.q, e.q.type === 2 ? e.time : 1, e.seq); });
+		let late = evs;
+		if (FENCES_AT_SUBMIT) { late = []; for (const e of evs) { if (e.q.type === 0) queryStore(e.q, 1, e.seq); else late.push(e); } }
+		if (late.length) {
+			fencesInFlight += late.length;
+			device.queue.onSubmittedWorkDone().then(() => { fencesInFlight -= late.length; for (const e of late) queryStore(e.q, e.q.type === 2 ? e.time : 1, e.seq); });
+		}
 	}
 }
 
@@ -3823,7 +3841,7 @@ async function present(id) {
 		const tn = performance.now();
 		if (!fpsChannel) { fpsChannel = new BroadcastChannel('game-fps'); fpsChannel.onmessage = (e) => { if (e.data && e.data.overlay !== undefined) overlayOn = !!e.data.overlay; }; }
 		fpsOverlayN++;
-		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.mips = mipPassesRun; ov.passDraw = passDrawN; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear(); for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
+		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.mips = mipPassesRun; ov.passDraw = passDrawN; ov.wRb = waitedOn.readback; ov.wOcc = waitedOn.occlusion; ov.wFence = waitedOn.fence; ov.rbN = readbacksDone; ov.rbMs = readbackMs; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear(); for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
 		else if (tn - fpsOverlayT >= 500) {
 			const n = Math.max(1, fpsOverlayN), ms = (tn - fpsOverlayT) / n, busy = gpuBusyMs(tn), gpuPer = (busy - ov.gpu) / n;
 			const byEffect = new Map();
@@ -3839,10 +3857,13 @@ async function present(id) {
 				passes: (passesBegun - ov.passes) / n, submits: (submits - ov.submits) / n, why: [...ovReasons].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k, c]) => [k, c / n]),
 				staged: (stagedUploads + renamedBuffers - ov.staged) / n, mips: (mipPassesRun - ov.mips) / n, mipsSkipped: (mipSkipped - ov.mipsSkipped) / n,
 				passDraw: (passDrawN - ov.passDraw) / n, passProxy: (passProxyN - ov.passProxy) / n, passClear: (passClearN - ov.passClear) / n,
+				// what the game sat waiting for (ms a frame this worker was idle with each kind of GPU answer outstanding), read-backs a frame and how long each took
+				waitRb: (waitedOn.readback - ov.wRb) / n, waitOcc: (waitedOn.occlusion - ov.wOcc) / n, waitFence: (waitedOn.fence - ov.wFence) / n,
+				rbs: (readbacksDone - ov.rbN) / n, rbMs: readbacksDone > ov.rbN ? (readbackMs - ov.rbMs) / (readbacksDone - ov.rbN) : 0, fencesAtSubmit: FENCES_AT_SUBMIT,
 				kept: KEPT_WHY.map((k, i) => [k, (keptWhy[i] - ov.kept[i]) / n]).filter((x) => x[1] >= 1).sort((a, b) => b[1] - a[1]).slice(0, 4), bgs: (bgCreated - ov.bgs) / n, mb: ov.upBytes / n / 1048576,
 				// shader modules and pipelines made per second: each is compiled by Chrome's GPU process (shown there only as "GPU busy"), many while new places stream in
 				newShaders: (shaderModuleCount - ov.mods) * 1000 / (tn - fpsOverlayT), newPipelines: (pipeCreates + aheadMade - ov.pipes) * 1000 / (tn - fpsOverlayT) });
-			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.mips = mipPassesRun; ov.passDraw = passDrawN; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear();
+			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.mips = mipPassesRun; ov.passDraw = passDrawN; ov.wRb = waitedOn.readback; ov.wOcc = waitedOn.occlusion; ov.wFence = waitedOn.fence; ov.rbN = readbacksDone; ov.rbMs = readbackMs; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear();
 			fpsOverlayN = 0; fpsOverlayT = tn; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = busy; ov.draws = drawCount;
 		}
 	}
@@ -4005,8 +4026,9 @@ async function runCommands(tail, head) {
 		case 37 /* CREATE_UAV */: createUav(p); break;
 		case 41 /* GENERATE_MIPS */: generateMips(u32[p]); break;
 		case 42 /* READBACK */: {		// the copy is recorded and submitted now (queue order is kept); only the mapping is awaited, without blocking this command loop
-			const flagAddr = u32[p + 15] + u32[p + 16] * 4294967296;
-			const done = () => { if (flagAddr) { refreshViews(); Atomics.store(i32, w32(flagAddr), 0); Atomics.notify(i32, w32(flagAddr)); } };
+			const flagAddr = u32[p + 15] + u32[p + 16] * 4294967296, rt0 = performance.now();
+			readbacksInFlight++;
+			const done = () => { readbacksInFlight--; readbacksDone++; readbackMs += performance.now() - rt0; if (flagAddr) { refreshViews(); Atomics.store(i32, w32(flagAddr), 0); Atomics.notify(i32, w32(flagAddr)); } };
 			readback(p).catch((e) => logLine('readback failed: ' + (e && e.message || e))).finally(done);
 			break;
 		}
@@ -4062,7 +4084,12 @@ async function loop() {
 			if (r && r.async) await r.value;
 			else if (!r) await new Promise((res) => setTimeout(res, 1));
 			Atomics.store(i32, hi + 5, 0);
-			idleMs += performance.now() - w0; fr.idle += performance.now() - w0;
+			const idle = performance.now() - w0;
+			idleMs += idle; fr.idle += idle;
+			// what the game may have been waiting for while it sent nothing: data read back from the GPU, occlusion results, fences answered by the GPU
+			if (readbacksInFlight) waitedOn.readback += idle;
+			if (pendingResolve.length || resolvesInFlight) waitedOn.occlusion += idle;
+			if (fencesInFlight) waitedOn.fence += idle;
 			continue;
 		}
 		const b0 = performance.now();

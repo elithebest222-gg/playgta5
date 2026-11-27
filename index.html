@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Play GTA V Browser From GN-MATH / Elijah Whisler</title>
+<title>GTA V Browser From GN-MATH / Elijah Whisler</title>
 <!-- The engine needs SharedArrayBuffer, which needs cross-origin isolation (the COOP/COEP headers). GitHub Pages cannot send those headers, so this service worker adds
      them to every response of the site. On the first visit it installs itself and reloads the page once. -->
 <script src="coi-serviceworker.js"></script>
@@ -57,9 +57,10 @@
 	/* setup screen: the player brings their own game folder (nothing of the game is hosted here) */
 	#setup { position: fixed; inset: 0; z-index: 20; overflow: auto; box-sizing: border-box; padding: 6vh 16px 32px; display: flex; justify-content: center; align-items: flex-start;
 		background: radial-gradient(ellipse at 50% 0%, #1a2027 0%, #0b0d10 55%, #050607 100%); color: #d7dbe0; font: 15px/1.5 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; }
-	#setup .card { width: 100%; max-width: 640px; box-sizing: border-box; background: rgba(19, 22, 27, .94); border: 1px solid #2a3038; border-radius: 12px; padding: 28px 28px 22px; box-shadow: 0 20px 60px rgba(0, 0, 0, .55); }
+	#setup .card { width: 100%; max-width: 640px; box-sizing: border-box; background: linear-gradient(180deg, rgba(26, 31, 38, .96), rgba(17, 20, 25, .96)); border: 1px solid #2a3038; border-top: 3px solid #7cc576; border-radius: 14px; padding: 28px 28px 22px; box-shadow: 0 24px 70px rgba(0, 0, 0, .6); }
 	#setup.dragging .card { outline: 2px dashed #7cc576; outline-offset: 8px; }
-	#setup h1 { margin: 0 0 6px; font-size: 24px; line-height: 1.25; color: #fff; }
+	#setup h1 { margin: 0 0 8px; font-size: 30px; line-height: 1.15; color: #fff; letter-spacing: -.01em; }
+	#setup .brand { margin: 0 0 4px; font-size: 12px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; background: linear-gradient(90deg, #7cc576, #f2b84b); -webkit-background-clip: text; background-clip: text; color: transparent; }
 	#setup h2 { margin: 22px 0 8px; font-size: 13px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: #8a939c; }
 	#setup p { margin: 0; }
 	#setup .lead { color: #aeb6bf; }
@@ -101,8 +102,9 @@
 <div id="toast"></div>
 <div id="setup">
 	<div class="card">
-		<h1>GTA V Browser Runtime</h1>
-		<p class="lead">The game runs entirely in your browser, from <b>your own copy</b> of the game files: the <code>mirror</code> folder (about 19.7 GB), or a .zip of it. This site does not host any game files.</p>
+		<p class="brand">GN-MATH · Elijah Whisler</p>
+		<h1>GTA V Browser</h1>
+		<p class="lead">The game runs entirely in your browser, from <b>your own copy</b> of the game files as a <code>.zip</code> (about 19.7 GB). This site does not host any game files.</p>
 		<h2>Your browser</h2>
 		<ul id="checks"><li class="wait">Checking…</li></ul>
 		<h2>Graphics</h2>
@@ -111,11 +113,11 @@
 		<h2>Your game files</h2>
 		<div class="row">
 			<button id="resume" class="primary" hidden></button>
-			<button id="choose" class="primary" disabled>Choose your mirror folder</button>
-			<button id="choose-zip" disabled>Choose a .zip instead</button>
+			<button id="choose-zip" class="primary" disabled>Choose your .zip</button>
+			<button id="choose" disabled hidden>Choose a folder instead</button>
 			<button id="start-anyway" hidden>Start anyway</button>
 		</div>
-		<p class="hint" id="pick-hint">Pick the zip file named GTA5Webport.zip. Here is the download: <a href="https://drive.google.com/file/d/14nSMYnFJiDz-nlDfPo_OL-sEkaa5L8XI/view?usp=sharing" target="_blank" rel="noopener noreferrer">GTA5Webport.zip</a>.</p>
+		<p class="hint" id="pick-hint">Pick your <code>GTA5Webport.zip</code>, or drop it on this page. It loads fastest when it is on this computer (not on Google Drive) and was made without compression.</p>
 		<p class="hint" id="status-head" aria-live="polite"></p>
 		<ul id="status" aria-live="polite"></ul>
 		<p class="fine">Your files are read straight from your disk by this page and never leave your computer. If the browser asks whether to “upload” them, that is only its standard wording for letting a page read a folder or file: nothing is sent anywhere.</p>
@@ -476,8 +478,14 @@ function fpsDetail(d) {
 	const refl = (d.refl || 0) + (d.reflSkip || 0) >= 1 ? 'reflections ' + Math.round(d.refl || 0) + ' drawn' + (d.reflSkip >= 1 ? ', ' + Math.round(d.reflSkip) + ' skipped (each face every ' + d.reflEvery + ' frames)' : '') : '';
 	// the graphics chip's own time for a sampled frame (timestamp queries), with the passes that took most
 	const chip = d.chip && d.chip.ms > 0 ? 'graphics chip: ' + ms(d.chip.ms) + ' of work a frame · ' + d.chip.top.filter((x) => x[1] >= 0.5).map((x) => x[0] + ' ' + ms(x[1])).join(' · ') : '';
+	// what the game sat waiting for while it sent nothing (wgpu_worker.js waitedOn): data read back from the GPU, occlusion results, fences answered by the GPU
+	const waits = d.waitRb === undefined ? '' : [d.waitRb >= 1 && 'read-backs ' + ms(d.waitRb) + (d.rbs >= 0.1 ? ' (' + (Math.round(d.rbs * 10) / 10) + ' a frame, ' + ms(d.rbMs || 0) + ' each)' : ''),
+		d.waitOcc >= 1 && 'occlusion results ' + ms(d.waitOcc), d.waitFence >= 1 && 'GPU fences ' + ms(d.waitFence)].filter(Boolean).join(' · ');
+	// the game's reads from the zip (io_worker.js ioStat): reads a second, MB a second, the wait per read (average, longest), unpacking of compressed files
+	const io = d.io && d.io.reads >= 0.5 ? 'zip: ' + Math.round(d.io.reads) + ' reads/s · ' + (Math.round(d.io.mb * 10) / 10) + ' MB/s · ' + ms(d.io.avgMs) + ' each, longest ' + ms(d.io.maxMs) +
+		(d.io.unpackMs >= 1 ? ' · unpacking compressed files ' + ms(d.io.unpackMs) + ' a second' : '') : '';
 	return ms(d.ms) + ' a frame · ' + Math.round(d.draws) + ' draws\nGPU busy ' + ms(gpu) + ' · translating ' + ms(work) + ' · waiting for the game ' + ms(d.idle) + (d.wait >= 0.5 ? ' · waiting for the GPU ' + ms(d.wait) : '') + (extra ? '\n' + extra : '') +
-		(top ? '\nmost drawn: ' + top : '') + (refl ? '\n' + refl : '') + (saved ? '\nsaved: ' + saved : '') + (chunks ? '\n' + chunks : '') + (handed ? '\n' + handed : '') + (chip ? '\n' + chip : '') + '\nslowest: ' + slowest;
+		(top ? '\nmost drawn: ' + top : '') + (refl ? '\n' + refl : '') + (saved ? '\nsaved: ' + saved : '') + (chunks ? '\n' + chunks : '') + (handed ? '\n' + handed : '') + (waits ? '\nthe game waited for: ' + waits : '') + (io ? '\n' + io : '') + (chip ? '\n' + chip : '') + '\nslowest: ' + slowest;
 }
 // FPS counter, top left: off by default, the = key toggles it. The GPU worker counts presented frames and posts the rate twice a second on 'game-fps'. The key does not reach
 // the game (capture phase on window, before the input handlers; this build has debug key bindings).
@@ -486,10 +494,13 @@ function fpsDetail(d) {
 	let on = false;
 	// the GPU worker times frames on the graphics chip (timestamp queries) only while the overlay is shown: told on each toggle, and again when a report says otherwise
 	const fpsCh = new BroadcastChannel('game-fps');
+	let lastIo = null;		// the io worker's reads from the zip (each second), shown with the GPU worker's next report
 	fpsCh.onmessage = (ev) => {
 		const d = ev.data;
+		if (d.io) { lastIo = d.io; return; }
 		if (d.overlay !== undefined && d.overlay !== on) fpsCh.postMessage({ overlay: on });
 		if (!on) return;
+		d.io = lastIo;
 		if (d.ms === undefined) { el.textContent = Math.round(d.fps) + ' FPS'; return; }
 		el.replaceChildren(Math.round(d.fps) + ' FPS', Object.assign(document.createElement('small'), { textContent: fpsDetail(d) }));
 	};
@@ -535,8 +546,8 @@ const LOW_ARGS = () => ['-textureQuality=0', '-pedVariety=0', '-vehicleVariety=0
 // Fastest, Fast and Balanced differ only in resolution: the same lowest world, effects off (EFFECTS_OFF) and reflections redrawn every 30th frame (wgpu_worker.js REFLECT_EVERY).
 // On a 4-thread Chromebook (Intel N100) the frame time is set mostly by the number of draws (~1,100 at the lowest settings), not by pixels: resolution buys some frames, not all.
 const QUALITY = {
-	fastest: { label: 'Fastest', scale: 0.35, cap: [960, 540], args: LOW_ARGS, reflect: 60, effectsOff: true, chunk: '60,8', occl: true, fpsGoal: 50, aheadPlay: 0,
-		about: '35 % resolution (very blurry), the lowest world and effects; buildings and props drawn within 60 m of you (more when there is room), small things only up close (car wheels too), nothing that is hidden behind a building or a hill. People and cars are always drawn. For the weakest graphics chips, such as an Intel N100 Chromebook.' },
+	fastest: { label: 'Fastest', scale: 0.5, cap: [960, 540], args: LOW_ARGS, reflect: 60, effectsOff: true, chunk: '60,8', occl: true, fpsGoal: 50, aheadPlay: 0,
+		about: '50 % resolution, the lowest world and effects; buildings and props drawn within 60 m of you (more when there is room), small things only up close (car wheels too), nothing that is hidden behind a building or a hill. People and cars are always drawn. For the weakest graphics chips, such as an Intel N100 Chromebook.' },
 	fast: { label: 'Fast', scale: 0.45, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '120,4', occl: true, fpsGoal: 40, aheadPlay: 0,
 		about: '45 % resolution, the lowest world and effects; buildings and props drawn within 120 m of you (40 to 240 m, following the frame rate), small things only up close, nothing that is hidden behind a building.' },
 	balanced: { label: 'Balanced', scale: 0.58, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '200,3', occl: true, fpsGoal: 30,
@@ -871,6 +882,9 @@ const $ = (id) => document.getElementById(id);
 const setupEl = $('setup'), checksEl = $('checks'), statusEl = $('status'), statusHead = $('status-head');
 const chooseBtn = $('choose'), zipBtn = $('choose-zip'), resumeBtn = $('resume'), anywayBtn = $('start-anyway'), folderInput = $('folder-input'), zipInput = $('zip-input');
 const canPickDir = typeof showDirectoryPicker === 'function', canPickFile = typeof showOpenFilePicker === 'function';
+// The game comes as a .zip (the player's GTA5Webport.zip); picking a folder instead is still there with ?folder=1 (an extracted copy, tests)
+const folderMode = q.get('folder') === '1';
+if (folderMode) { chooseBtn.hidden = false; }
 const setPicking = (on) => { chooseBtn.disabled = zipBtn.disabled = resumeBtn.disabled = !on; };
 const fmtN = (n) => n.toLocaleString('en-US');
 const count = (n, one, many) => fmtN(n) + ' ' + (n === 1 ? one : many);
@@ -1369,7 +1383,7 @@ if (canPickDir) recallFolder().then((saved) => {
 	resumeBtn.hidden = false;
 	chooseBtn.textContent = 'Choose another folder';
 	zipBtn.textContent = 'Choose another .zip';
-	chooseBtn.classList.remove('primary');
+	chooseBtn.classList.remove('primary'); zipBtn.classList.remove('primary');
 	resumeBtn.onclick = async () => {
 		if (busy) return;
 		let state = 'denied';
@@ -1377,11 +1391,11 @@ if (canPickDir) recallFolder().then((saved) => {
 		if (state !== 'granted') { showRows(statusEl, [['warn', 'Reading “' + saved.name + '” was not allowed. Allow it, or choose the folder again.']]); return; }
 		useFolder(async (p) => {
 			try { return saved.kind === 'file' ? await readZip(await saved.getFile(), p) : await readHandle(saved, p); }
-			catch (e) { if (e && e.name === 'NotFoundError') { forgetFolder(); resumeBtn.hidden = true; chooseBtn.classList.add('primary'); throw new FolderError('“' + saved.name + '” is not there any more (moved or deleted?): choose it again.'); } throw e; }
+			catch (e) { if (e && e.name === 'NotFoundError') { forgetFolder(); resumeBtn.hidden = true; (folderMode ? chooseBtn : zipBtn).classList.add('primary'); throw new FolderError('“' + saved.name + '” is not there any more (moved or deleted?): choose it again.'); } throw e; }
 		});
 	};
 });
-if (!canPickDir) $('pick-hint').append(' Your browser will list the whole folder first, which can take a moment.');
+if (folderMode && !canPickDir) $('pick-hint').append(' With a folder, your browser lists the whole folder first, which can take a moment.');
 {		// the graphics preset choice (QUALITY above), remembered for the next visit
 	const sel = $('quality'), about = $('quality-about');
 	for (const [k, v] of Object.entries(QUALITY)) sel.append(new Option(v.label + (k === QUALITY_DEFAULT ? ' (recommended for this device)' : ''), k));
