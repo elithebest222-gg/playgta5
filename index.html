@@ -461,11 +461,15 @@ function fpsDetail(d) {
 	const dist = d.chunk && (d.chunk.dist > 0 || d.chunk.tiny > 0);
 	const chunks = !dist && !d.occl ? '' : d.chunkActive === false ? 'draw distance: not working here (the game\'s object positions were not found), nothing left out'
 		: [dist && (d.chunk.dist > 0 ? 'draw distance ' + d.chunk.dist + ' m' + (d.chunkAuto > 0 ? ' (aiming at ' + Math.round(1000 / d.chunkAuto) + ' fps)' : '') + ' · ' : '') + Math.round(d.culled || 0) + ' far or tiny draws left out',
-			d.occl && (d.occlOn ? Math.round(d.hidden || 0) + ' hidden behind others' : 'hidden ones: off here (' + (d.occlWhy || 'no depth yet') + ')'), d.sizedPct >= 0 && 'sizes known ' + d.sizedPct + ' %'].filter(Boolean).join(' · ');
+			d.occl && (d.occlOn ? Math.round(d.hidden || 0) + ' hidden behind others' : 'hidden ones: off here (' + (d.occlWhy || 'no depth yet') + ')'), d.sizedPct >= 0 && 'sizes known ' + d.sizedPct + ' %',
+			// why the world's draws that were drawn were kept (skinned, instanced, no position, other view, size unknown, near...): what could be left out next
+			d.kept && d.kept.length && 'kept: ' + d.kept.map((x) => Math.round(x[1]) + ' ' + x[0]).join(', ')].filter(Boolean).join(' · ');
 	// what the graphics side was handed per frame: render/compute passes, submits (each costs Chrome's GPU process a lot on a slow CPU) and their main reasons, data updates
 	// done as copies instead of submits, bind groups made, MB uploaded (textures and buffers streaming in)
 	const f1 = (x) => (x >= 10 ? Math.round(x) : Math.round(x * 10) / 10);
-	const handed = d.passes === undefined ? '' : 'per frame: ' + f1(d.passes) + ' passes · ' + f1(d.submits) + ' submits' + (d.why && d.why.length ? ' (' + d.why.map((x) => x[0] + ' ' + f1(x[1])).join(', ') + ')' : '') +
+	// the passes by what they are for: drawing, mipmaps (and how many were skipped: the picture had not changed), depth/float copies for shaders that read them, clears
+	const kinds = d.passDraw === undefined ? '' : [f1(d.passDraw) + ' drawing', d.mips >= 0.1 && f1(d.mips) + ' mipmap', d.passProxy >= 0.1 && f1(d.passProxy) + ' depth copies', d.passClear >= 0.1 && f1(d.passClear) + ' clears'].filter(Boolean).join(', ');
+	const handed = d.passes === undefined ? '' : 'per frame: ' + f1(d.passes) + ' passes' + (kinds ? ' (' + kinds + ')' : '') + (d.mipsSkipped >= 0.5 ? ' · ' + f1(d.mipsSkipped) + ' mipmap passes skipped' : '') + ' · ' + f1(d.submits) + ' submits' + (d.why && d.why.length ? ' (' + d.why.map((x) => x[0] + ' ' + f1(x[1])).join(', ') + ')' : '') +
 		(d.staged >= 0.1 ? ' · ' + f1(d.staged) + ' updates copied in place' : '') + ' · ' + f1(d.bgs || 0) + ' bind groups made · ' + f1(d.mb || 0) + ' MB uploaded';
 	// what the draws are (the shader effect: ped, vehicle_*, trees*, normal*... = buildings and props, im = blits and UI, ...) and the reflection cube map's share
 	const top = (d.top || []).filter((x) => x[1] >= 1).map((x) => x[0] + ' ' + Math.round(x[1])).join(' · ');
