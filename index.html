@@ -461,14 +461,19 @@ function fpsDetail(d) {
 	const dist = d.chunk && (d.chunk.dist > 0 || d.chunk.tiny > 0);
 	const chunks = !dist && !d.occl ? '' : d.chunkActive === false ? 'draw distance: not working here (the game\'s object positions were not found), nothing left out'
 		: [dist && (d.chunk.dist > 0 ? 'draw distance ' + d.chunk.dist + ' m' + (d.chunkAuto > 0 ? ' (aiming at ' + Math.round(1000 / d.chunkAuto) + ' fps)' : '') + ' · ' : '') + Math.round(d.culled || 0) + ' far or tiny draws left out',
-			d.occl && (d.occlOn ? Math.round(d.hidden || 0) + ' hidden behind others' : 'hidden ones: no depth yet'), d.sizedPct >= 0 && 'sizes known ' + d.sizedPct + ' %'].filter(Boolean).join(' · ');
+			d.occl && (d.occlOn ? Math.round(d.hidden || 0) + ' hidden behind others' : 'hidden ones: off here (' + (d.occlWhy || 'no depth yet') + ')'), d.sizedPct >= 0 && 'sizes known ' + d.sizedPct + ' %'].filter(Boolean).join(' · ');
+	// what the graphics side was handed per frame: render/compute passes, submits (each costs Chrome's GPU process a lot on a slow CPU) and their main reasons, data updates
+	// done as copies instead of submits, bind groups made, MB uploaded (textures and buffers streaming in)
+	const f1 = (x) => (x >= 10 ? Math.round(x) : Math.round(x * 10) / 10);
+	const handed = d.passes === undefined ? '' : 'per frame: ' + f1(d.passes) + ' passes · ' + f1(d.submits) + ' submits' + (d.why && d.why.length ? ' (' + d.why.map((x) => x[0] + ' ' + f1(x[1])).join(', ') + ')' : '') +
+		(d.staged >= 0.1 ? ' · ' + f1(d.staged) + ' updates copied in place' : '') + ' · ' + f1(d.bgs || 0) + ' bind groups made · ' + f1(d.mb || 0) + ' MB uploaded';
 	// what the draws are (the shader effect: ped, vehicle_*, trees*, normal*... = buildings and props, im = blits and UI, ...) and the reflection cube map's share
 	const top = (d.top || []).filter((x) => x[1] >= 1).map((x) => x[0] + ' ' + Math.round(x[1])).join(' · ');
 	const refl = (d.refl || 0) + (d.reflSkip || 0) >= 1 ? 'reflections ' + Math.round(d.refl || 0) + ' drawn' + (d.reflSkip >= 1 ? ', ' + Math.round(d.reflSkip) + ' skipped (each face every ' + d.reflEvery + ' frames)' : '') : '';
 	// the graphics chip's own time for a sampled frame (timestamp queries), with the passes that took most
 	const chip = d.chip && d.chip.ms > 0 ? 'graphics chip: ' + ms(d.chip.ms) + ' of work a frame · ' + d.chip.top.filter((x) => x[1] >= 0.5).map((x) => x[0] + ' ' + ms(x[1])).join(' · ') : '';
 	return ms(d.ms) + ' a frame · ' + Math.round(d.draws) + ' draws\nGPU busy ' + ms(gpu) + ' · translating ' + ms(work) + ' · waiting for the game ' + ms(d.idle) + (d.wait >= 0.5 ? ' · waiting for the GPU ' + ms(d.wait) : '') + (extra ? '\n' + extra : '') +
-		(top ? '\nmost drawn: ' + top : '') + (refl ? '\n' + refl : '') + (saved ? '\nsaved: ' + saved : '') + (chunks ? '\n' + chunks : '') + (chip ? '\n' + chip : '') + '\nslowest: ' + slowest;
+		(top ? '\nmost drawn: ' + top : '') + (refl ? '\n' + refl : '') + (saved ? '\nsaved: ' + saved : '') + (chunks ? '\n' + chunks : '') + (handed ? '\n' + handed : '') + (chip ? '\n' + chip : '') + '\nslowest: ' + slowest;
 }
 // FPS counter, top left: off by default, the = key toggles it. The GPU worker counts presented frames and posts the rate twice a second on 'game-fps'. The key does not reach
 // the game (capture phase on window, before the input handlers; this build has debug key bindings).
@@ -526,8 +531,8 @@ const LOW_ARGS = () => ['-textureQuality=0', '-pedVariety=0', '-vehicleVariety=0
 // Fastest, Fast and Balanced differ only in resolution: the same lowest world, effects off (EFFECTS_OFF) and reflections redrawn every 30th frame (wgpu_worker.js REFLECT_EVERY).
 // On a 4-thread Chromebook (Intel N100) the frame time is set mostly by the number of draws (~1,100 at the lowest settings), not by pixels: resolution buys some frames, not all.
 const QUALITY = {
-	fastest: { label: 'Fastest', scale: 0.35, cap: [960, 540], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '80,6', occl: true, fpsGoal: 50, aheadPlay: 0,
-		about: '35 % resolution (very blurry), the lowest world and effects; buildings and props drawn within 80 m of you (more when there is room), small things only up close, nothing that is hidden behind a building. People and cars are always drawn. A fallback for the weakest graphics chips.' },
+	fastest: { label: 'Fastest', scale: 0.35, cap: [960, 540], args: LOW_ARGS, reflect: 60, effectsOff: true, chunk: '60,8', occl: true, fpsGoal: 50, aheadPlay: 0,
+		about: '35 % resolution (very blurry), the lowest world and effects; buildings and props drawn within 60 m of you (more when there is room), small things only up close (car wheels too), nothing that is hidden behind a building or a hill. People and cars are always drawn. For the weakest graphics chips, such as an Intel N100 Chromebook.' },
 	fast: { label: 'Fast', scale: 0.45, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '120,4', occl: true, fpsGoal: 40, aheadPlay: 0,
 		about: '45 % resolution, the lowest world and effects; buildings and props drawn within 120 m of you (40 to 240 m, following the frame rate), small things only up close, nothing that is hidden behind a building.' },
 	balanced: { label: 'Balanced', scale: 0.58, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '200,3', occl: true, fpsGoal: 30,
