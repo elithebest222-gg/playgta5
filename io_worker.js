@@ -476,7 +476,7 @@ async function readWithoutStore(id, off, len, dst) {
 // entries and names at boot: 3-4 reads per archive; the 33 KB radio stream blocks) go through a small cache of 64 KB blocks, so neighbouring small reads cost
 // one disk read instead of one each; big reads (streamed resources) go straight into the heap.
 let localFiles = null;		// file id -> File (null: not in the player's folder); null when the data comes over HTTP
-const LBS = 65536, LCACHE_MAX = 64 * 1048576;
+const LBS = 65536, LCACHE_MAX = (self.navigator && self.navigator.deviceMemory && self.navigator.deviceMemory <= 8 ? 32 : 64) * 1048576;		// 32 MB on an 8 GB computer: the game's own memory comes first
 const lcache = new Map(), linflight = new Map();		// id * 1048576 + block -> Uint8Array (LRU) / Promise of it
 let lcacheBytes = 0, localErrors = 0;
 // At most LOCAL_READS_MAX reads of the player's files in flight; the rest wait their turn in order. The engine's threads ask for many ranges at once while the world streams in
