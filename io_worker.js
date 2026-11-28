@@ -561,12 +561,58 @@ function inflate(id) {
 	}
 	return p;
 }
+// ---- fewer passers-by and traffic (page ?pop=peds,cars; Fastest: 2,4) -------------------------------------------------------------------------------------------
+// levels/gta5/popcycle.dat holds, for every area of the map and every 2 hours of the day, the most ambient people, scenario people (sitting, standing about), cars,
+// parked cars and low-priority parked cars the game keeps around the player, then cop shares, scenario model counts and a ped/car group list. Each such line is
+// rewritten as it is read from the player's zip: people at most `peds` (scenario people 0, so `peds` is the whole count), cars at most `cars`, parked cars at most
+// half of that. Every number keeps its width (zero-padded), so the file keeps its size. Mission characters and cars are created by the story scripts, not by this
+// table: they are not affected. Everything else in the file is left as it is.
+const POPCYCLE = /(^|\/)levels\/gta5\/popcycle\.dat$/i;
+let popCap = null, popcycleDone = new Map();
+function parsePop(s) {
+	const m = /^(\d+),(\d+)$/.exec(String(s || ''));
+	return m ? { peds: +m[1], cars: +m[2] } : null;
+}
+function rewritePopcycle(text, cap) {
+	const caps = [cap.peds, 0, cap.cars, cap.cars >> 1, 0, -1, -1, -1, 0, cap.cars >> 1];		// per column; -1: unchanged
+	let lines = 0;
+	const out = text.replace(/^([ \t]+)(\d+(?:[ \t]+\d+){9})(?=[ \t]+peds\b)/gm, (all, lead, nums) => {
+		lines++;
+		return lead + nums.replace(/\d+/g, (() => { let k = 0; return (v) => { const c = caps[k++]; return c < 0 || +v <= c ? v : String(c).padStart(v.length, '0'); }; })());
+	});
+	return { out, lines };
+}
+async function popcycleBytes(id) {
+	let p = popcycleDone.get(id);
+	if (!p) {
+		p = (async () => {
+			const file = localFiles[id];
+			const raw = file.deflated ? await inflate(id) : await readBlob(file.slice(0, file.size));
+			let text = '';
+			for (let i = 0; i < raw.length; i += 8192) text += String.fromCharCode.apply(null, raw.subarray(i, i + 8192));		// byte for byte (no decoding)
+			const r = rewritePopcycle(text, popCap);
+			const bytes = new Uint8Array(raw.length);
+			for (let i = 0; i < r.out.length && i < bytes.length; i++) bytes[i] = r.out.charCodeAt(i);
+			log('[io] popcycle.dat: ' + r.lines + ' lines capped to ' + popCap.peds + ' people, ' + popCap.cars + ' cars');
+			if (bc) bc.postMessage({ popcycle: { lines: r.lines, peds: popCap.peds, cars: popCap.cars } });
+			return r.out.length === raw.length ? bytes : raw;		// (always the same length: numbers keep their width)
+		})();
+		popcycleDone.set(id, p);
+	}
+	return p;
+}
 // Copies [off, off + len) of file id into the heap at dst; returns the bytes copied (fewer at the end of the file).
 async function readLocal(id, off, len, dst) {
 	const f = files[id], file = localFiles[id];
 	if (!file) throw new Error('the file is not in the folder');
 	const end = Math.min(off + len, file.size);
 	if (off >= end) return 0;
+	if (popCap && POPCYCLE.test(f.path)) {		// the population limits, rewritten (popcycleBytes)
+		const data = await popcycleBytes(id);
+		views();
+		HEAPU8.set(data.subarray(off, end), dst);
+		return end - off;
+	}
 	if (file.deflated) {
 		const cached = inflate(id), data = cached instanceof Uint8Array ? cached : await cached;
 		views();
@@ -719,7 +765,7 @@ async function loop() {
 
 let ready = null;
 async function init(m) {
-	base = m.base; bc = new BroadcastChannel('game-progress'); remoteLog = !!m.log; noHints = !!m.noHints;
+	base = m.base; bc = new BroadcastChannel('game-progress'); remoteLog = !!m.log; noHints = !!m.noHints; popCap = parsePop(m.pop);
 	if (m.local) {
 		// The player's folder (index.html): the manifest the engine was given (its entries are the engine's file ids, sizes as on the player's disk) and a File per
 		// entry come with the message. No store: the files are on the disk already.

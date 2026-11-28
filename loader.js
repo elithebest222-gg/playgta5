@@ -35,7 +35,7 @@ self.onmessage = (ev) => {
 	// the GPU worker reads the shaders (index, pipeline seeds, packs) from the folder: its fetch of <B>/shaders/<name> is answered from these Files (wgpu_worker.js localFiles)
 	if (L) gpu.postMessage({ localFiles: { prefix: B + '/shaders/', files: L.shaders, dir: L.shaderDir || null } });
 	const io = new Worker(B + '/io_worker.js');
-	io.postMessage({ init: true, base: dataBase, local: L && { manifest: L.manifest, files: L.files }, noStore: !!m.noStore, record: !!m.record, trace: !!m.trace, log: !!m.remoteLog, noHints: !!m.noHints, bootset: m.lowMemory ? 'bootset_low.json' : 'bootset.json' });		// starts the prefetch of the boot read set at once		// HTTP reads of all engine threads (platform/file/httpfs_wasm.cpp); same reason to create it up front
+	io.postMessage({ init: true, base: dataBase, local: L && { manifest: L.manifest, files: L.files }, noStore: !!m.noStore, record: !!m.record, trace: !!m.trace, log: !!m.remoteLog, noHints: !!m.noHints, pop: m.pop || '', bootset: m.lowMemory ? 'bootset_low.json' : 'bootset.json' });		// starts the prefetch of the boot read set at once		// HTTP reads of all engine threads (platform/file/httpfs_wasm.cpp); same reason to create it up front
 	// The engine reads the data manifest itself (game.js wasm_httpfs_manifest_js, a synchronous request): give it the one the io worker has, from a URL that works
 	// on every engine thread (pthreads find it in their script's query string) and wherever the page is hosted.
 	const manifestUrl = L ? URL.createObjectURL(new Blob([L.manifestText], { type: 'application/json' })) : dataBase + 'manifest.json';
@@ -164,7 +164,7 @@ self.onmessage = (ev) => {
 			}],
 		};
 		// __log/__logFlush come from prejs.js, which only exists once game.js is loaded: note the start line in the console.
-		console.log('loader: starting engine: ' + m.args.join(' ') + ' (cores ' + m.cores + ', pipeline seed ' + (m.lowMemory || m.lowSeed ? 'low' : 'full') + ', reflections every ' + (m.reflect || 1) + ' frame(s), draw distance ' + (m.chunk || '0') + (m.chunkAuto > 0 ? ' aiming at ' + Math.round(1000 / m.chunkAuto) + ' fps' : '') + ', occlusion ' + (m.occl ? 'on' : 'off') + (m.skipFx ? ', leaving out ' + m.skipFx : '') + ', compiling ahead in play ' + (m.aheadPlay !== undefined ? m.aheadPlay : 1) + ')');
+		console.log('loader: starting engine: ' + m.args.join(' ') + ' (cores ' + m.cores + ', pipeline seed ' + (m.lowMemory || m.lowSeed ? 'low' : 'full') + ', reflections every ' + (m.reflect || 1) + ' frame(s), draw distance ' + (m.chunk || '0') + (m.chunkAuto > 0 ? ' aiming at ' + Math.round(1000 / m.chunkAuto) + ' fps' : '') + ', occlusion ' + (m.occl ? 'on' : 'off') + (m.skipFx ? ', leaving out ' + m.skipFx : '') + (m.pop ? ', population ' + m.pop : '') + ', compiling ahead in play ' + (m.aheadPlay !== undefined ? m.aheadPlay : 1) + ')');
 		importScripts(B + '/game.js');
 	};
 	gpu.onerror = (e) => console.error('gpu worker failed to load: ' + e.message);
