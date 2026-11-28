@@ -147,6 +147,13 @@ async function run() {
 		rb.push((performance.now() - t0) / 4);
 	}
 	row('read-back (copy, submit, map, wait)', median(rb), 'each; the game waits for ~4 a frame');
+	for (const mb of [1, 4]) {
+		const big = device.createBuffer({ size: mb << 20, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST }), dst = device.createBuffer({ size: mb << 20, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+		const tb = [];
+		for (let i = 0; i < 6; i++) { const t0 = performance.now(); const e = device.createCommandEncoder(); e.copyBufferToBuffer(big, 0, dst, 0, mb << 20); device.queue.submit([e.finish()]); await dst.mapAsync(GPUMapMode.READ); new Uint8Array(dst.getMappedRange()).slice(0, 16); dst.unmap(); tb.push(performance.now() - t0); }
+		row('read-back of ' + mb + ' MB', median(tb), 'each');
+		big.destroy(); dst.destroy();
+	}
 
 	status('6/8 uploads');
 	const data = new Uint8Array(512 * 1024);

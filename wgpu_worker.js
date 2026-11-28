@@ -283,16 +283,16 @@ function namePass(prog) {
 // Chromebook while a frame of the same shape in probe.html takes 11 ms: this names the part where the time goes.
 const segAgg = new Map();
 let segLastDone = 0, segP0 = 0, segD0 = 0, segPl0 = 0, segBg0 = 0, plSets = 0, bgSets = 0;
-let ringBytes = 0, vbSets = 0, ibSets = 0, occqN = 0, upAll = 0;		// (per part of the frame: constants written, vertex/index buffer bindings, occlusion queries, other uploads)
-const segC0 = { rb: 0, vb: 0, ib: 0, ind: 0, oq: 0, up: 0 };
+let ringBytes = 0, vbSets = 0, ibSets = 0, occqN = 0, upAll = 0, rbBytes = 0, rbBig = 0;		// rbBytes: read back (game read-backs); rbBig: the largest single read-back since the overlay's last report		// (per part of the frame: constants written, vertex/index buffer bindings, occlusion queries, other uploads)
+const segC0 = { rb: 0, vb: 0, ib: 0, ind: 0, oq: 0, up: 0, rd: 0 };
 function segTrack(reason) {
-	const t = performance.now(), e0 = { p: passDrawN - segP0, d: drawCount - segD0, pl: plSets - segPl0, bg: bgSets - segBg0, rb: ringBytes - segC0.rb, vb: vbSets - segC0.vb, ib: ibSets - segC0.ib, ind: indirectDraws - segC0.ind, oq: occqN - segC0.oq, up: upAll - segC0.up };
-	segP0 = passDrawN; segD0 = drawCount; segPl0 = plSets; segBg0 = bgSets; segC0.rb = ringBytes; segC0.vb = vbSets; segC0.ib = ibSets; segC0.ind = indirectDraws; segC0.oq = occqN; segC0.up = upAll;
+	const t = performance.now(), e0 = { p: passDrawN - segP0, d: drawCount - segD0, pl: plSets - segPl0, bg: bgSets - segBg0, rb: ringBytes - segC0.rb, vb: vbSets - segC0.vb, ib: ibSets - segC0.ib, ind: indirectDraws - segC0.ind, oq: occqN - segC0.oq, up: upAll - segC0.up, rd: rbBytes - segC0.rd };
+	segP0 = passDrawN; segD0 = drawCount; segPl0 = plSets; segBg0 = bgSets; segC0.rb = ringBytes; segC0.vb = vbSets; segC0.ib = ibSets; segC0.ind = indirectDraws; segC0.oq = occqN; segC0.up = upAll; segC0.rd = rbBytes;
 	device.queue.onSubmittedWorkDone().then(() => {
 		const done = performance.now(), ms = done - Math.max(t, segLastDone);
 		segLastDone = done;
 		let e = segAgg.get(reason);
-		if (!e) segAgg.set(reason, e = { ms: 0, n: 0, p: 0, d: 0, pl: 0, bg: 0, rb: 0, vb: 0, ib: 0, ind: 0, oq: 0, up: 0 });
+		if (!e) segAgg.set(reason, e = { ms: 0, n: 0, p: 0, d: 0, pl: 0, bg: 0, rb: 0, vb: 0, ib: 0, ind: 0, oq: 0, up: 0, rd: 0 });
 		for (const k in e0) e[k] += e0[k];
 		e.ms += ms; e.n++;
 	});
@@ -3539,6 +3539,7 @@ async function readback(p) {
 		const n = hasBox ? r - l : Math.min(size, src.size), padded = (n + 3) & ~3;
 		const MU = GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ, rbSize = Math.max(4, padded);
 		const rb = pooledBuffer(rbSize, MU);
+		rbBytes += rbSize; if (rbSize > rbBig) rbBig = rbSize;
 		endPass();
 		getEncoder().copyBufferToBuffer(src.gpu, hasBox ? l : 0, rb, 0, rbSize);
 		flush('readback');
@@ -3558,6 +3559,8 @@ async function readback(p) {
 	const bx = Math.ceil(w / bi.bw), by = Math.ceil(h / bi.bh), rowBytes = bx * bi.bytes, bpr = Math.ceil(rowBytes / 256) * 256;
 	const MU = GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ, rbSize = bpr * by * d;
 	const rb = pooledBuffer(rbSize, MU);
+	rbBytes += rbSize; if (rbSize > rbBig) rbBig = rbSize;
+	if (rbSize > 65536) logOnce('rbbig' + src.format + w + 'x' + h, 'read-back of ' + w + 'x' + h + 'x' + d + ' ' + src.format + ' (' + (rbSize / 1048576).toFixed(2) + ' MB)');
 	endPass();
 	getEncoder().copyTextureToBuffer({ texture: src.tex, mipLevel: mip, origin: { x: x0, y: y0, z: three ? z0 : layer } }, { buffer: rb, bytesPerRow: bpr, rowsPerImage: by },
 		{ width: bx * bi.bw, height: by * bi.bh, depthOrArrayLayers: three ? d : 1 });
@@ -3998,7 +4001,7 @@ async function present(id) {
 		const tn = performance.now();
 		if (!fpsChannel) { fpsChannel = new BroadcastChannel('game-fps'); fpsChannel.onmessage = (e) => { if (e.data && e.data.overlay !== undefined) overlayOn = !!e.data.overlay; }; }
 		fpsOverlayN++;
-		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.cpDef = copiesDeferred; ov.cpSplit = copySplits; ov.mips = mipPassesRun; ov.passDraw = passDrawN; passHist.clear(); segAgg.clear(); ov.cmds = commandsRun; ov.fxSkipped = fxSkipped; ov.wRb = waitedOn.readback; ov.wOcc = waitedOn.occlusion; ov.wFence = waitedOn.fence; ov.rbN = readbacksDone; ov.rbMs = readbackMs; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear(); for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
+		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.cpDef = copiesDeferred; ov.cpSplit = copySplits; ov.mips = mipPassesRun; ov.passDraw = passDrawN; passHist.clear(); segAgg.clear(); rbBig = 0; ov.cmds = commandsRun; ov.fxSkipped = fxSkipped; ov.wRb = waitedOn.readback; ov.wOcc = waitedOn.occlusion; ov.wFence = waitedOn.fence; ov.rbN = readbacksDone; ov.rbMs = readbackMs; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear(); for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
 		else if (tn - fpsOverlayT >= 500) {
 			const n = Math.max(1, fpsOverlayN), ms = (tn - fpsOverlayT) / n, busy = gpuBusyMs(tn), gpuPer = (busy - ov.gpu) / n;
 			const byEffect = new Map();
@@ -4015,7 +4018,8 @@ async function present(id) {
 				staged: (stagedUploads + renamedBuffers - ov.staged) / n, cpDef: (copiesDeferred - ov.cpDef) / n, cpSplit: (copySplits - ov.cpSplit) / n, mips: (mipPassesRun - ov.mips) / n, mipsSkipped: (mipSkipped - ov.mipsSkipped) / n,
 				passDraw: (passDrawN - ov.passDraw) / n, passProxy: (passProxyN - ov.passProxy) / n, passClear: (passClearN - ov.passClear) / n,
 				cmds: (commandsRun - ov.cmds) / n, fxSkipped: (fxSkipped - ov.fxSkipped) / n, skipFx: SKIP_FX.join(','),
-				segs: [...segAgg].sort((a, b) => b[1].ms - a[1].ms).slice(0, 5).map(([r, e]) => [r, e.ms / n, e.n / n, e.p / n, e.d / n, e.pl / n, e.bg / n, e.rb / n / 1048576, e.vb / n, e.ib / n, e.ind / n, e.oq / n, e.up / n / 1048576]),
+				segs: [...segAgg].sort((a, b) => b[1].ms - a[1].ms).slice(0, 5).map(([r, e]) => [r, e.ms / n, e.n / n, e.p / n, e.d / n, e.pl / n, e.bg / n, e.rb / n / 1048576, e.vb / n, e.ib / n, e.ind / n, e.oq / n, e.up / n / 1048576, e.rd / n / 1048576]),
+				rbBig: rbBig / 1048576,
 				passTop: [...passHist].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k2, c]) => [k2, c / n]), depthLoads: depthLoadVariants,
 				// what the game sat waiting for (ms a frame this worker was idle with each kind of GPU answer outstanding), read-backs a frame and how long each took
 				waitRb: (waitedOn.readback - ov.wRb) / n, waitOcc: (waitedOn.occlusion - ov.wOcc) / n, waitFence: (waitedOn.fence - ov.wFence) / n,
@@ -4023,7 +4027,7 @@ async function present(id) {
 				kept: KEPT_WHY.map((k, i) => [k, (keptWhy[i] - ov.kept[i]) / n]).filter((x) => x[1] >= 1).sort((a, b) => b[1] - a[1]).slice(0, 4), bgs: (bgCreated - ov.bgs) / n, mb: ov.upBytes / n / 1048576,
 				// shader modules and pipelines made per second: each is compiled by Chrome's GPU process (shown there only as "GPU busy"), many while new places stream in
 				newShaders: (shaderModuleCount - ov.mods) * 1000 / (tn - fpsOverlayT), newPipelines: (pipeCreates + aheadMade - ov.pipes) * 1000 / (tn - fpsOverlayT) });
-			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.cpDef = copiesDeferred; ov.cpSplit = copySplits; ov.mips = mipPassesRun; ov.passDraw = passDrawN; passHist.clear(); segAgg.clear(); ov.cmds = commandsRun; ov.fxSkipped = fxSkipped; ov.wRb = waitedOn.readback; ov.wOcc = waitedOn.occlusion; ov.wFence = waitedOn.fence; ov.rbN = readbacksDone; ov.rbMs = readbackMs; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear();
+			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.cpDef = copiesDeferred; ov.cpSplit = copySplits; ov.mips = mipPassesRun; ov.passDraw = passDrawN; passHist.clear(); segAgg.clear(); rbBig = 0; ov.cmds = commandsRun; ov.fxSkipped = fxSkipped; ov.wRb = waitedOn.readback; ov.wOcc = waitedOn.occlusion; ov.wFence = waitedOn.fence; ov.rbN = readbacksDone; ov.rbMs = readbackMs; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear();
 			fpsOverlayN = 0; fpsOverlayT = tn; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = busy; ov.draws = drawCount;
 		}
 	}
