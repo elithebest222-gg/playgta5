@@ -141,7 +141,7 @@ let noF32Filter = false, noD32S8 = false, noRG11 = false;
 let mem = null, memBuffer = null, i32 = null, u32 = null, f32 = null, u8 = null, ringBase = 0, ringSize = 0;
 let canvas = null, canvasCtx = null, canvasFormat = null, blit = null, canvasConfigured = false;
 let fpsChannel = null, fpsOverlayN = 0, fpsOverlayT = 0, overlayOn = false;		// overlayOn: the page shows the overlay ('=' key): only then are frames timed on the chip (gpuTiming)
-const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0, merged: 0, reused: 0, noop: 0, culled: 0, chunkFrames: 0, mods: 0, pipes: 0, sized: 0, sizedK: 0, hidden: 0, passes: 0, submits: 0, bgs: 0, upBytes: 0, staged: 0, mips: 0, mipsSkipped: 0, kept: null, passDraw: 0, passProxy: 0, passClear: 0, wRb: 0, wOcc: 0, wFence: 0, rbN: 0, rbMs: 0 };		// merged/reused/noop: the counters' values at the last report		// the frame-rate overlay's sums since its last report (present)
+const ov = { idle: 0, wait: 0, pipe: 0, up: 0, draws: 0, gpu: 0, refl: 0, reflSkip: 0, merged: 0, reused: 0, noop: 0, culled: 0, chunkFrames: 0, mods: 0, pipes: 0, sized: 0, sizedK: 0, hidden: 0, passes: 0, submits: 0, bgs: 0, upBytes: 0, staged: 0, mips: 0, mipsSkipped: 0, kept: null, passDraw: 0, passProxy: 0, passClear: 0, wRb: 0, wOcc: 0, wFence: 0, rbN: 0, rbMs: 0, cmds: 0, fxSkipped: 0 };		// merged/reused/noop: the counters' values at the last report		// the frame-rate overlay's sums since its last report (present)
 const ovProgs = [];		// the programs drawn since the overlay's last report, each with its count in `ovN` (summed per effect for the report)
 // The GPU's share of a frame (the overlay's "GPU"): the time during which some submitted work is not finished yet, from the submit to the moment this worker learns that the
 // newest submit is done (its event loop gets a turn at least every 2 ms). It includes the GPU process's own work on the commands, so it is a little long, never short.
@@ -252,7 +252,7 @@ let passSt = newPassSt();
 let encEpoch = 1, submits = 0, submits0 = 0;
 const usedInEncoder = { add(o) { if (o) o.enc = encEpoch; }, has(o) { return !!o && o.enc === encEpoch; }, clear() { encEpoch++; } };
 const flushReasons = new Map(), ovReasons = new Map();		// submits per reason since the last fps line / the overlay's last report
-let passesBegun = 0, passDrawN = 0, passProxyN = 0, passClearN = 0;		// all passes; those for draws (ensurePass), depth/float copies (proxies), clears of their own
+let passesBegun = 0, passDrawN = 0, passProxyN = 0, passClearN = 0, commandsRun = 0;		// all passes; those for draws (ensurePass), depth/float copies (proxies), clears of their own
 function flush(reason) {
 	const tf0 = performance.now();
 	if (encoder || pass) { const r = reason || 'other'; flushReasons.set(r, (flushReasons.get(r) || 0) + 1); ovReasons.set(r, (ovReasons.get(r) || 0) + 1); }
@@ -862,9 +862,10 @@ const REFLECT_EVERY = isNode ? +(process.env.WGPU_REFLECT_EVERY || 1) : Math.max
 // frame's other draws. Anything else is drawn as before.
 const CHUNK = (() => {
 	const v = (isNode ? process.env.WGPU_CHUNK || '' : new URLSearchParams(self.location.search).get('chunk') || '').split(',').map((x) => Math.max(0, +x || 0));
-	return { dist: v[0] || 0, tiny: Math.min(0.05, (v[1] || 0) / 1000) };
+	return { dist: v[0] || 0, tiny: Math.min(0.05, (v[1] || 0) / 1000), min: v[2] >= 10 ? v[2] : 40 };
 })();
-const CHUNK_MIN_DIST = 40, CHUNK_MAX_TINY = 0.02;		// while the distance follows the frame rate: never nearer than 40 m, never more than 2 % for `tiny`
+// while the distance follows the frame rate: never nearer than CHUNK.min (?chunk=dist,tiny,min; 40 m unless given: the page's Fastest 30 m), never more than 2 % for `tiny`
+const CHUNK_MIN_DIST = CHUNK.min, CHUNK_MAX_TINY = 0.02;
 const chunkCam = { frame: -1, x: 0, y: 0, z: 0 };
 let chunkCulled = 0, chunkSized = 0, chunkUnsized = 0, chunkFrames = 0;
 // A draw distance that follows the frame rate (?chunkauto=<target frame time in ms>, the page's presets): once a second it is scaled, down (x0.85, to 0.4 of the preset's
@@ -890,7 +891,7 @@ function chunkApplyScale(scale) {
 // 6: see-through glass and fences of the world (blended or alpha-tested), 7: the ground's tiles (terrain*: only when hidden, never for distance or size)
 function chunkKind(label) {
 	const k = label.indexOf('::'), e = (k > 0 ? label.slice(0, k) : label).toLowerCase();
-	if (/^terrain/.test(e)) return 7;
+	if (/terrain/.test(e)) return 7;		// terrain*, default_terrain_wet (the wet ground's layers): the ground, only when hidden
 	if (/^(terrain|water|sky|cloud|im$|imms|postfx|deferred|lighting|ptfx|ptxgpu|rmptfx|debug|scaleform|radar|rage_|shadow|ssao|hdao|blur|cascade|mirror|billboard|grass|light|spot|point|capsule|tiled|volume|fog|lens|rain|snow|corona|vfx|cubemap|reflect|seethrough|occlu|stencil|copy|clear|downsample|gpu|cs_|directional|distortion|memory|adaptive|avg|damage|distance|dof|exposure|golf|mlaa|silhouette|skinblend|waveform|rope|cable|blend_2lyr)/.test(e)) return 0;
 	if (/terrain|_wet|shadow/.test(e)) return 0;		// the ground (wet ground layers too) and shadow-only geometry
 	if (/^(ped|cloth|vehicle|weapon|hair)/.test(e)) return 2;
@@ -1004,6 +1005,14 @@ function chunkCb(slot) {
 }
 let chunkCbOff = 0;
 // Is this draw an object of the world that is too far, too small for its distance, or hidden (occlusion, below)? 0: draw it, 1: too far or too small, 2: hidden
+// Effects left out altogether (?skipfx=prefix,prefix: the shader effect's name starts with one; the page's Fastest: grass_fur, the shell layers of furry lawn grass, a draw per
+// layer: 32 of 468 draws in an N100 Chromebook's frame on a lawn). The ground under them stays.
+const SKIP_FX = (isNode ? process.env.WGPU_SKIP_FX || '' : new URLSearchParams(self.location.search).get('skipfx') || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+let fxSkipped = 0;
+function skipFxOf(prog) {
+	if (prog.skipFx === undefined) { const l = (prog.label || '').toLowerCase(), k = l.indexOf('::'), e = k > 0 ? l.slice(0, k) : l; prog.skipFx = SKIP_FX.some((x) => e.startsWith(x)); }
+	return prog.skipFx;
+}
 // Why a draw of the world (kinds 1-7) was kept, counted for the overlay (what to look at next): KEPT_WHY names the counters of keptWhy
 const KEPT_WHY = ['instanced', 'other pass', 'skinned', 'no matrices', 'no position', 'other view', 'size unknown', 'near', 'before the camera'];
 const keptWhy = new Float64Array(KEPT_WHY.length);
@@ -1073,7 +1082,9 @@ function chunkCull(vsProg, psProg, inst) {
 // and for smaller moves the box is widened by how far the nearest thing in front of it can have shifted on the screen (an object coming out from behind a corner).
 // Nothing is left out because of the grid that the grid's own frame drew: what was left out is not in it, and comes back as soon as a grid shows it uncovered.
 const OCCL = isNode ? process.env.WGPU_OCCL === '1' : new URLSearchParams(self.location.search).get('occl') === '1';
-const OCCL_GRID = 64, OCCL_MAX_MOVE = 4, OCCL_MAX_AGE = 4, OCCL_REL = 1.02, OCCL_ABS = 0.3;
+// OCCL_MAX_AGE: with the GPU fences answered at submit the game runs up to FRAME_SLOTS frames ahead of the GPU, and a grid comes back 3-5 frames after its frame (an N100
+// Chromebook's overlay said "depth too old" at 4); the camera-move limit and the widening by the shift of what is in front keep an older grid safe
+const OCCL_GRID = 64, OCCL_MAX_MOVE = 4, OCCL_MAX_AGE = 8, OCCL_REL = 1.02, OCCL_ABS = 0.3;
 const occl = { frame: -1, ds: 0, mip: 0, slice: 0, vp: [0, 0, 0, 0, 0, 1], VP: null, cam: [0, 0, 0], open: false, busy: null, ready: null, pipe: null, params: null, out: null, rbs: [], moved: 0, movedFrame: -1, snaps: 0, why: '' };
 let occlCulled = 0;
 // the frame's main view (chunkCull, its first G-buffer draw): its depth target, viewport and camera; chunkW/chunkWVP hold that draw's gWorld and gWorldViewProj
@@ -1146,7 +1157,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 // once the frame's G-buffer pass is over (ensurePass, when the next pass is something else; present): the grid of the main view's depth, recorded into this encoder
 function occlSnapshot() {
 	occl.open = false;
-	if (occl.busy || !occl.VP || occl.frame !== presentCount) return;		// the last one is still being read
+	if ((occl.busy && !occl.busy.mapping) || !occl.VP || occl.frame !== presentCount) return;		// one not submitted yet (the same frame); grids being read overlap
 	const t = objs.get(occl.ds);
 	if (!t || t.kind !== 'texture' || !t.tex || !isDepth(t.format)) { occl.why = 'no depth buffer in the main view'; return; }
 	if (t.desc.sampleCount > 1 || t.desc.dimension !== '2d') { occl.why = 'a multisampled or layered depth buffer'; return; }
@@ -1192,7 +1203,7 @@ function occlMap() {
 			far[k] = toW(rev ? lo : hi); near[k] = toW(rev ? hi : lo);
 		}
 		s.rb.unmap(); occl.rbs.push(s.rb);
-		occl.ready = { far, near, gw: s.gw, gh: s.gh, VP: s.VP, cam: s.cam, frame: s.frame };
+		if (!occl.ready || s.frame > occl.ready.frame) occl.ready = { far, near, gw: s.gw, gh: s.gh, VP: s.VP, cam: s.cam, frame: s.frame };		// the newest grid wins
 		if (occl.busy === s) occl.busy = null;
 	}, () => { if (occl.busy === s) occl.busy = null; });
 }
@@ -1953,6 +1964,16 @@ function depthStencilFor(dss, dsFormat, roDepth, roStencil) {
 	return d;
 }
 
+// does a D3D blend state blend with the blend constant (D3D11_BLEND_BLEND_FACTOR 14, INV_BLEND_FACTOR 15) on any target?
+function blendUsesConst(state) {
+	const w = state.words;
+	if (!w) return true;
+	for (let rt = 0; rt < (w[1] ? 8 : 1); rt++) {
+		const q = 2 + rt * 8;
+		if (w[q] && (w[q + 1] === 14 || w[q + 1] === 15 || w[q + 2] === 14 || w[q + 2] === 15 || w[q + 4] === 14 || w[q + 4] === 15 || w[q + 5] === 14 || w[q + 5] === 15)) return true;
+	}
+	return false;
+}
 function blendFor(state, rtIndex) {
 	if (!state) return { write: 0xf };
 	const w = state.words;		// D3D11_BLEND_DESC: AlphaToCoverage, Independent, RT[8] x 8 words {enable, src, dst, op, srcA, dstA, opA, mask}
@@ -2389,7 +2410,10 @@ function ensurePass() {
 	beginOcclusionInPass();
 	passInfo = { rtInfo, dsFormat, colorCount: colorAttachments.length, roDepth: !!dt && (S.ds.flags & 1) !== 0, roStencil: !!dt && (S.ds.flags & 2) !== 0, width: passW, height: passH };
 	applied = {};
+	// A pass starts with WebGPU's defaults (the whole target as viewport, depth 0..1, and as scissor rectangle, blend constant 0, stencil reference 0): draws that want
+	// those set nothing. Every call costs twice on a Chromebook (packed here, executed in Chrome's GPU process): these four were set at the start of every pass.
 	passSt = newPassSt();
+	passSt.vp = [0, 0, passW, passH, 0, 1]; passSt.sc = [0, 0, passW, passH]; passSt.bf = [0, 0, 0, 0]; passSt.sref = 0;
 	return true;
 }
 let passInfo = null;
@@ -2680,6 +2704,7 @@ function doDraw(p) {
 	let vsProg = shaderProgram(vsObj);
 	let psProg = psObj ? shaderProgram(psObj) : null;
 	if (!vsProg || (psObj && !psProg)) { skipDraw('if (!vsProg || (psObj && !psProg)) { skippedDraws++; return;'); return; }
+	if (SKIP_FX.length && psProg && skipFxOf(psProg)) { fxSkipped++; return; }		// an effect left out altogether (SKIP_FX)
 	if ((CHUNK.dist > 0 || CHUNK.tiny > 0 || OCCL) && kind < 4) { const c = chunkCull(vsProg, psProg, inst); if (c) { if (c === 1) chunkCulled++; else occlCulled++; return; } }		// too far, too small or hidden
 	if (vsProg.overTex || (psProg && psProg.overTex)) {		// more textures than this device allows per stage: a variant for the textures bound now (fitTextures)
 		const vv = vsProg.overTex ? fitTextures(vsObj, vsProg, 0) : null, pv = psProg && psProg.overTex ? fitTextures(psObj, psProg, 1) : null;
@@ -2758,9 +2783,16 @@ function doDraw(p) {
 		const c = S.scissors[0], x0 = Math.min(passInfo.width, c[0]), y0 = Math.min(passInfo.height, c[1]), x1 = Math.min(passInfo.width, Math.max(x0, c[2])), y1 = Math.min(passInfo.height, Math.max(y0, c[3]));
 		setScissorOnce(x0, y0, x1 - x0, y1 - y0);
 	} else setScissorOnce(0, 0, passInfo.width, passInfo.height);
-	const bf = S.blend.factor, ob = passSt.bf;
-	if (!ob || ob[0] !== bf[0] || ob[1] !== bf[1] || ob[2] !== bf[2] || ob[3] !== bf[3]) { pass.setBlendConstant(bf); const sb = passSt.bf || (passSt.bf = [0, 0, 0, 0]); sb[0] = bf[0]; sb[1] = bf[1]; sb[2] = bf[2]; sb[3] = bf[3]; }
-	if (passSt.sref !== S.dss.ref) { pass.setStencilReference(S.dss.ref); passSt.sref = S.dss.ref; }
+	// the blend constant only for blend states that use it (D3D's BLEND_FACTOR / INV_BLEND_FACTOR), the stencil reference only with the stencil test on
+	const bso = S.blend.id ? objs.get(S.blend.id) : null;
+	if (bso && (bso.usesConst !== undefined ? bso.usesConst : (bso.usesConst = blendUsesConst(bso)))) {
+		const bf = S.blend.factor, ob = passSt.bf;
+		if (!ob || ob[0] !== bf[0] || ob[1] !== bf[1] || ob[2] !== bf[2] || ob[3] !== bf[3]) { pass.setBlendConstant(bf); const sb = passSt.bf || (passSt.bf = [0, 0, 0, 0]); sb[0] = bf[0]; sb[1] = bf[1]; sb[2] = bf[2]; sb[3] = bf[3]; }
+	}
+	if (passSt.sref !== S.dss.ref && passInfo.dsFormat && hasStencil(passInfo.dsFormat)) {
+		const dso = S.dss.id ? objs.get(S.dss.id) : null;
+		if (dso && dso.words[3]) { pass.setStencilReference(S.dss.ref); passSt.sref = S.dss.ref; }
+	}
 	if (debugPs && psProg && psProg.label.includes(debugPs) && debugPsSeen < debugPsN) { debugPsSeen++; dumpDraw(kind, count, inst, start, baseVertex, vsProg, psProg, layout, g0, g1, true); debugPsProbe = { ps: psProg }; }
 	if (debugDraw && drawCount >= debugDraw && drawCount < debugDraw + debugDrawN) dumpDraw(kind, count, inst, start, baseVertex, vsProg, psProg, layout, g0, g1);
 	if (kind >= 4) {
@@ -3841,7 +3873,7 @@ async function present(id) {
 		const tn = performance.now();
 		if (!fpsChannel) { fpsChannel = new BroadcastChannel('game-fps'); fpsChannel.onmessage = (e) => { if (e.data && e.data.overlay !== undefined) overlayOn = !!e.data.overlay; }; }
 		fpsOverlayN++;
-		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.mips = mipPassesRun; ov.passDraw = passDrawN; ov.wRb = waitedOn.readback; ov.wOcc = waitedOn.occlusion; ov.wFence = waitedOn.fence; ov.rbN = readbacksDone; ov.rbMs = readbackMs; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear(); for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
+		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.mips = mipPassesRun; ov.passDraw = passDrawN; ov.cmds = commandsRun; ov.fxSkipped = fxSkipped; ov.wRb = waitedOn.readback; ov.wOcc = waitedOn.occlusion; ov.wFence = waitedOn.fence; ov.rbN = readbacksDone; ov.rbMs = readbackMs; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear(); for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
 		else if (tn - fpsOverlayT >= 500) {
 			const n = Math.max(1, fpsOverlayN), ms = (tn - fpsOverlayT) / n, busy = gpuBusyMs(tn), gpuPer = (busy - ov.gpu) / n;
 			const byEffect = new Map();
@@ -3857,13 +3889,14 @@ async function present(id) {
 				passes: (passesBegun - ov.passes) / n, submits: (submits - ov.submits) / n, why: [...ovReasons].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k, c]) => [k, c / n]),
 				staged: (stagedUploads + renamedBuffers - ov.staged) / n, mips: (mipPassesRun - ov.mips) / n, mipsSkipped: (mipSkipped - ov.mipsSkipped) / n,
 				passDraw: (passDrawN - ov.passDraw) / n, passProxy: (passProxyN - ov.passProxy) / n, passClear: (passClearN - ov.passClear) / n,
+				cmds: (commandsRun - ov.cmds) / n, fxSkipped: (fxSkipped - ov.fxSkipped) / n, skipFx: SKIP_FX.join(','),
 				// what the game sat waiting for (ms a frame this worker was idle with each kind of GPU answer outstanding), read-backs a frame and how long each took
 				waitRb: (waitedOn.readback - ov.wRb) / n, waitOcc: (waitedOn.occlusion - ov.wOcc) / n, waitFence: (waitedOn.fence - ov.wFence) / n,
 				rbs: (readbacksDone - ov.rbN) / n, rbMs: readbacksDone > ov.rbN ? (readbackMs - ov.rbMs) / (readbacksDone - ov.rbN) : 0, fencesAtSubmit: FENCES_AT_SUBMIT,
 				kept: KEPT_WHY.map((k, i) => [k, (keptWhy[i] - ov.kept[i]) / n]).filter((x) => x[1] >= 1).sort((a, b) => b[1] - a[1]).slice(0, 4), bgs: (bgCreated - ov.bgs) / n, mb: ov.upBytes / n / 1048576,
 				// shader modules and pipelines made per second: each is compiled by Chrome's GPU process (shown there only as "GPU busy"), many while new places stream in
 				newShaders: (shaderModuleCount - ov.mods) * 1000 / (tn - fpsOverlayT), newPipelines: (pipeCreates + aheadMade - ov.pipes) * 1000 / (tn - fpsOverlayT) });
-			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.mips = mipPassesRun; ov.passDraw = passDrawN; ov.wRb = waitedOn.readback; ov.wOcc = waitedOn.occlusion; ov.wFence = waitedOn.fence; ov.rbN = readbacksDone; ov.rbMs = readbackMs; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear();
+			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.mips = mipPassesRun; ov.passDraw = passDrawN; ov.cmds = commandsRun; ov.fxSkipped = fxSkipped; ov.wRb = waitedOn.readback; ov.wOcc = waitedOn.occlusion; ov.wFence = waitedOn.fence; ov.rbN = readbacksDone; ov.rbMs = readbackMs; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear();
 			fpsOverlayN = 0; fpsOverlayT = tn; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = busy; ov.draws = drawCount;
 		}
 	}
@@ -4048,7 +4081,7 @@ async function runCommands(tail, head) {
 		tail += n * 4 + 8;
 		if (++sinceYield >= 512) {
 			sinceYield = 0;
-			Atomics.add(i32, ringW + 3, executedLocal); executedLocal = 0;
+			Atomics.add(i32, ringW + 3, executedLocal); commandsRun += executedLocal; executedLocal = 0;
 			Atomics.store(i32, ringW + 1, tail);		// let the producers reuse the ring space already consumed
 			Atomics.notify(i32, ringW + 1);
 			// The event loop gets a turn at most every 2 ms (completion callbacks: fences, readbacks, queries): a MessageChannel round trip per 512 commands was ~50 per frame
@@ -4094,7 +4127,7 @@ async function loop() {
 		}
 		const b0 = performance.now();
 		tail = await runCommands(tail, head);
-		if (executedLocal) { Atomics.add(i32, ringW + 3, executedLocal); executedLocal = 0; }
+		if (executedLocal) { Atomics.add(i32, ringW + 3, executedLocal); commandsRun += executedLocal; executedLocal = 0; }
 		busyMs += performance.now() - b0;
 		refreshViews();
 		Atomics.store(i32, ti, tail);
