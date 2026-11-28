@@ -1000,6 +1000,7 @@ function chunkApplyScale(scale) {
 function chunkKind(label) {
 	const k = label.indexOf('::'), e = (k > 0 ? label.slice(0, k) : label).toLowerCase();
 	if (/terrain/.test(e)) return 7;		// terrain*, default_terrain_wet (the wet ground's layers): the ground, only when hidden
+	if (/^water/.test(e) && !/tex|sim|height|foam/.test(e)) return 7;		// the water's surface: like the ground, left out only when hidden (in the city, behind the buildings); not its simulation passes
 	if (/^(terrain|water|sky|cloud|im$|imms|postfx|deferred|lighting|ptfx|ptxgpu|rmptfx|debug|scaleform|radar|rage_|shadow|ssao|hdao|blur|cascade|mirror|billboard|grass|light|spot|point|capsule|tiled|volume|fog|lens|rain|snow|corona|vfx|cubemap|reflect|seethrough|occlu|stencil|copy|clear|downsample|gpu|cs_|directional|distortion|memory|adaptive|avg|damage|distance|dof|exposure|golf|mlaa|silhouette|skinblend|waveform|rope|cable|blend_2lyr)/.test(e)) return 0;
 	if (/terrain|_wet|shadow/.test(e)) return 0;		// the ground (wet ground layers too) and shadow-only geometry
 	if (/^(ped|cloth|vehicle|weapon|hair)/.test(e)) return 2;
