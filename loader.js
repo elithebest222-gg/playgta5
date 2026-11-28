@@ -22,6 +22,7 @@ self.onmessage = (ev) => {
 	if (m.reflect > 1) gq.set('reflect', String(m.reflect));		// the reflection cube map redrawn every n-th frame per face (wgpu_worker.js REFLECT_EVERY)
 	if (m.chunk && m.chunk !== '0') gq.set('chunk', String(m.chunk));		// the draw distance by object size (wgpu_worker.js CHUNK)
 	if (m.occl) gq.set('occl', '1');		// what an earlier frame's depth shows hidden is not drawn (wgpu_worker.js OCCL)
+	if (m.skipFx) gq.set('skipfx', String(m.skipFx));		// shader effects left out altogether (wgpu_worker.js SKIP_FX)
 	if (m.aheadPlay !== undefined && m.aheadPlay !== 1) gq.set('aheadplay', String(m.aheadPlay));		// pipelines compiled ahead while playing (wgpu_worker.js AHEAD_PLAY)
 	if (m.chunk && m.chunk !== '0' && m.chunkAuto > 0) gq.set('chunkauto', m.chunkAuto.toFixed(1));		// the draw distance follows the frame rate (CHUNK_AUTO: the target frame time in ms)
 	if (m.nanHunt) gq.set('nanhunt', '1');		// ?nanhunt=1: find the first draw that writes NaN into an HDR target, shown on the page
@@ -163,7 +164,7 @@ self.onmessage = (ev) => {
 			}],
 		};
 		// __log/__logFlush come from prejs.js, which only exists once game.js is loaded: note the start line in the console.
-		console.log('loader: starting engine: ' + m.args.join(' ') + ' (cores ' + m.cores + ', pipeline seed ' + (m.lowMemory || m.lowSeed ? 'low' : 'full') + ', reflections every ' + (m.reflect || 1) + ' frame(s), draw distance ' + (m.chunk || '0') + (m.chunkAuto > 0 ? ' aiming at ' + Math.round(1000 / m.chunkAuto) + ' fps' : '') + ', occlusion ' + (m.occl ? 'on' : 'off') + ', compiling ahead in play ' + (m.aheadPlay !== undefined ? m.aheadPlay : 1) + ')');
+		console.log('loader: starting engine: ' + m.args.join(' ') + ' (cores ' + m.cores + ', pipeline seed ' + (m.lowMemory || m.lowSeed ? 'low' : 'full') + ', reflections every ' + (m.reflect || 1) + ' frame(s), draw distance ' + (m.chunk || '0') + (m.chunkAuto > 0 ? ' aiming at ' + Math.round(1000 / m.chunkAuto) + ' fps' : '') + ', occlusion ' + (m.occl ? 'on' : 'off') + (m.skipFx ? ', leaving out ' + m.skipFx : '') + ', compiling ahead in play ' + (m.aheadPlay !== undefined ? m.aheadPlay : 1) + ')');
 		importScripts(B + '/game.js');
 	};
 	gpu.onerror = (e) => console.error('gpu worker failed to load: ' + e.message);
