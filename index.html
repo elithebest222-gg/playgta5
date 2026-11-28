@@ -485,8 +485,10 @@ function fpsDetail(d) {
 	// the game's reads from the zip (io_worker.js ioStat): reads a second, MB a second, the wait per read (average, longest), unpacking of compressed files
 	const io = d.io && d.io.reads >= 0.5 ? 'zip: ' + Math.round(d.io.reads) + ' reads/s · ' + (Math.round(d.io.mb * 10) / 10) + ' MB/s · ' + ms(d.io.avgMs) + ' each, longest ' + ms(d.io.maxMs) +
 		(d.io.unpackMs >= 1 ? ' · unpacking compressed files ' + ms(d.io.unpackMs) + ' a second' : '') : '';
+	// the drawing passes by the effect of their first draw and their target, per frame (the most first): where the passes come from
+	const passTop = d.passTop && d.passTop.length ? 'passes start with: ' + d.passTop.map((x) => x[0] + ' ' + (Math.round(x[1] * 10) / 10)).join(' · ') : '';
 	return ms(d.ms) + ' a frame · ' + Math.round(d.draws) + ' draws\nGPU busy ' + ms(gpu) + ' · translating ' + ms(work) + ' · waiting for the game ' + ms(d.idle) + (d.wait >= 0.5 ? ' · waiting for the GPU ' + ms(d.wait) : '') + (extra ? '\n' + extra : '') +
-		(top ? '\nmost drawn: ' + top : '') + (refl ? '\n' + refl : '') + (saved ? '\nsaved: ' + saved : '') + (chunks ? '\n' + chunks : '') + (handed ? '\n' + handed : '') + (waits ? '\nthe game waited for: ' + waits : '') + (io ? '\n' + io : '') + (chip ? '\n' + chip : '') + '\nslowest: ' + slowest;
+		(top ? '\nmost drawn: ' + top : '') + (refl ? '\n' + refl : '') + (saved ? '\nsaved: ' + saved : '') + (chunks ? '\n' + chunks : '') + (handed ? '\n' + handed : '') + (passTop ? '\n' + passTop : '') + (waits ? '\nthe game waited for: ' + waits : '') + (io ? '\n' + io : '') + (chip ? '\n' + chip : '') + '\nslowest: ' + slowest;
 }
 // FPS counter, top left: off by default, the = key toggles it. The GPU worker counts presented frames and posts the rate twice a second on 'game-fps'. The key does not reach
 // the game (capture phase on window, before the input handlers; this build has debug key bindings).
@@ -556,8 +558,9 @@ const QUALITY = {
 	full: { label: 'Full', scale: 1, cap: [3840, 2160], args: () => [], reflect: 1, effectsOff: false, chunk: '0', occl: false,
 		about: 'Native resolution and the game\'s own settings (effects the other presets turned off come back). For gaming PCs.' },
 };
-// The device's default: Balanced on a Chromebook or with 4 or fewer CPU threads (the low-memory profile, 4 GB or less, always runs Fast), Full otherwise
-const QUALITY_DEFAULT = /\bCrOS\b/.test(navigator.userAgent) || navigator.hardwareConcurrency <= 4 || (navigator.deviceMemory && navigator.deviceMemory <= 4) ? 'balanced' : 'full';
+// The device's default: Fastest on a Chromebook or with 4 or fewer CPU threads (an N100 Chromebook: 15 fps on Fastest, Chrome's GPU process the limit; the low-memory
+// profile, 4 GB or less, always runs Fast), Full otherwise
+const QUALITY_DEFAULT = /\bCrOS\b/.test(navigator.userAgent) || navigator.hardwareConcurrency <= 4 || (navigator.deviceMemory && navigator.deviceMemory <= 4) ? 'fastest' : 'full';
 let quality = QUALITY[q.get('quality')] ? q.get('quality') : (() => { try { const v = localStorage.getItem('gta5-quality'); return QUALITY[v] ? v : QUALITY_DEFAULT; } catch (e) { return QUALITY_DEFAULT; } })();
 // Low-memory profile (?low=1 forces it, ?low=0 forbids it; default: navigator.deviceMemory <= 4, which browsers report as 4 for 4 GB and less)
 const isLowMemory = () => { const v = q.get('low'); return v === '1' || (v !== '0' && !!navigator.deviceMemory && navigator.deviceMemory <= 4); };
