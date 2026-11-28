@@ -549,8 +549,8 @@ const LOW_ARGS = () => ['-textureQuality=0', '-pedVariety=0', '-vehicleVariety=0
 // Fastest, Fast and Balanced differ only in resolution: the same lowest world, effects off (EFFECTS_OFF) and reflections redrawn every 30th frame (wgpu_worker.js REFLECT_EVERY).
 // On a 4-thread Chromebook (Intel N100) the frame time is set mostly by the number of draws (~1,100 at the lowest settings), not by pixels: resolution buys some frames, not all.
 const QUALITY = {
-	fastest: { label: 'Fastest', scale: 0.5, cap: [640, 360], args: LOW_ARGS, reflect: 60, effectsOff: true, chunk: '60,8,30', occl: true, fpsGoal: 50, aheadPlay: 0, skipFx: 'grass_fur',
-		about: '360p at most (640x360; half the width and height of the window, a quarter of its pixels), the lowest world and effects, no furry lawn grass; buildings and props drawn within 60 m of you (down to 30 m while the game is slow, more when there is room), small things only up close (car wheels too), nothing that is hidden behind a building or a hill. People and cars are always drawn. For the weakest graphics chips, such as an Intel N100 Chromebook.' },
+	fastest: { label: 'Fastest', scale: 0.5, cap: [480, 270], pop: '2,4', args: LOW_ARGS, reflect: 60, effectsOff: true, chunk: '60,8,30', occl: true, fpsGoal: 50, aheadPlay: 0, skipFx: 'grass_fur',
+		about: '270p at most (480x270; half the width and height of the window at most), at most 2 passers-by and 4 traffic cars around you (mission characters and cars are not affected), the lowest world and effects, no furry lawn grass; buildings and props drawn within 60 m of you (down to 30 m while the game is slow, more when there is room), small things only up close (car wheels too), nothing that is hidden behind a building or a hill. People and cars are always drawn. For the weakest graphics chips, such as an Intel N100 Chromebook.' },
 	fast: { label: 'Fast', scale: 0.45, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '120,4', occl: true, fpsGoal: 40, aheadPlay: 0,
 		about: '45 % resolution, the lowest world and effects; buildings and props drawn within 120 m of you (40 to 240 m, following the frame rate), small things only up close, nothing that is hidden behind a building.' },
 	balanced: { label: 'Balanced', scale: 0.58, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '200,3', occl: true, fpsGoal: 30,
@@ -695,6 +695,7 @@ function startEngine(local) {
 		// occlusion (wgpu_worker.js OCCL): what an earlier frame's depth shows hidden behind other things is not drawn; ?occl=0 / ?occl=1 turns it off / on
 		occl: q.get('occl') !== null ? q.get('occl') === '1' : !!preset.occl,
 		// shader effects left out altogether (wgpu_worker.js SKIP_FX): Fastest drops the furry lawn grass (a draw per shell layer); ?skipfx= sets the list, ?skipfx=none drops nothing
+		pop: q.get('pop') !== null ? (q.get('pop') === '0' ? '' : q.get('pop')) : preset.pop || '',		// ?pop=2,4: at most 2 passers-by and 4 traffic cars (io_worker.js popcycle.dat); ?pop=0 the game's own numbers
 		skipFx: q.get('skipfx') !== null ? (q.get('skipfx') === 'none' ? '' : q.get('skipfx')) : preset.skipFx || '',
 		// the draw distance follows the frame rate (wgpu_worker.js CHUNK_AUTO): the target frame time in ms; ?fpsgoal=0 keeps it fixed, ?fpsgoal=45 aims at 45 fps
 		chunkAuto: ((g) => (g > 0 ? 1000 / g : 0))(q.get('fpsgoal') !== null ? +q.get('fpsgoal') : preset.fpsGoal || 0),
