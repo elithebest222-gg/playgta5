@@ -283,15 +283,18 @@ function namePass(prog) {
 // Chromebook while a frame of the same shape in probe.html takes 11 ms: this names the part where the time goes.
 const segAgg = new Map();
 let segLastDone = 0, segP0 = 0, segD0 = 0, segPl0 = 0, segBg0 = 0, plSets = 0, bgSets = 0;
+let ringBytes = 0, vbSets = 0, ibSets = 0, occqN = 0, upAll = 0;		// (per part of the frame: constants written, vertex/index buffer bindings, occlusion queries, other uploads)
+const segC0 = { rb: 0, vb: 0, ib: 0, ind: 0, oq: 0, up: 0 };
 function segTrack(reason) {
-	const t = performance.now(), e0 = { p: passDrawN - segP0, d: drawCount - segD0, pl: plSets - segPl0, bg: bgSets - segBg0 };
-	segP0 = passDrawN; segD0 = drawCount; segPl0 = plSets; segBg0 = bgSets;
+	const t = performance.now(), e0 = { p: passDrawN - segP0, d: drawCount - segD0, pl: plSets - segPl0, bg: bgSets - segBg0, rb: ringBytes - segC0.rb, vb: vbSets - segC0.vb, ib: ibSets - segC0.ib, ind: indirectDraws - segC0.ind, oq: occqN - segC0.oq, up: upAll - segC0.up };
+	segP0 = passDrawN; segD0 = drawCount; segPl0 = plSets; segBg0 = bgSets; segC0.rb = ringBytes; segC0.vb = vbSets; segC0.ib = ibSets; segC0.ind = indirectDraws; segC0.oq = occqN; segC0.up = upAll;
 	device.queue.onSubmittedWorkDone().then(() => {
 		const done = performance.now(), ms = done - Math.max(t, segLastDone);
 		segLastDone = done;
 		let e = segAgg.get(reason);
-		if (!e) segAgg.set(reason, e = { ms: 0, n: 0, p: 0, d: 0, pl: 0, bg: 0 });
-		e.ms += ms; e.n++; e.p += e0.p; e.d += e0.d; e.pl += e0.pl; e.bg += e0.bg;
+		if (!e) segAgg.set(reason, e = { ms: 0, n: 0, p: 0, d: 0, pl: 0, bg: 0, rb: 0, vb: 0, ib: 0, ind: 0, oq: 0, up: 0 });
+		for (const k in e0) e[k] += e0[k];
+		e.ms += ms; e.n++;
 	});
 }
 function flush(reason) {
@@ -1691,7 +1694,7 @@ function stageReserve(chunk, off, n) {
 function flushUniforms() {
 	for (const c of dirtyChunks) {
 		const hi = Math.min(c.stage.length, (c.hi + 3) & ~3);
-		device.queue.writeBuffer(c.buf, c.base + c.lo, c.stage, c.lo, hi - c.lo);
+		device.queue.writeBuffer(c.buf, c.base + c.lo, c.stage, c.lo, hi - c.lo); ringBytes += hi - c.lo;
 		c.lo = undefined; c.hi = 0;
 	}
 	dirtyChunks.clear();
@@ -2875,7 +2878,7 @@ function doDraw(p) {
 		}
 		const shift = e.cls === 1 ? (foldI ? startInstance * vb.stride : 0) : (foldV ? (indexed ? baseVertex : start) * vb.stride : 0);
 		const voff = vb.offset + shift < 0 ? 0 : vb.offset + shift;
-		if (passSt.vb[e.slot] !== o.gpu || passSt.vbo[e.slot] !== voff) { pass.setVertexBuffer(e.slot, o.gpu, voff); passSt.vb[e.slot] = o.gpu; passSt.vbo[e.slot] = voff; }
+		if (passSt.vb[e.slot] !== o.gpu || passSt.vbo[e.slot] !== voff) { pass.setVertexBuffer(e.slot, o.gpu, voff); vbSets++; passSt.vb[e.slot] = o.gpu; passSt.vbo[e.slot] = voff; }
 		vbAvail[e.slot] = o.bytes - voff;
 		usedInEncoder.add(o);
 	}
@@ -2885,7 +2888,7 @@ function doDraw(p) {
 		if (!ib || !ib.gpu) { skipDraw('if (!ib || !ib.gpu) { skippedDraws++; return; }'); return; }
 		const ifmt = S.ib.fmt === 57 ? 'uint16' : 'uint32';
 		ibMax = Math.floor((ib.bytes - S.ib.offset) / (ifmt === 'uint16' ? 2 : 4)) - start;
-		if (passSt.ib !== ib.gpu || passSt.ibFmt !== ifmt || passSt.ibOff !== S.ib.offset) { pass.setIndexBuffer(ib.gpu, ifmt, S.ib.offset); passSt.ib = ib.gpu; passSt.ibFmt = ifmt; passSt.ibOff = S.ib.offset; }
+		if (passSt.ib !== ib.gpu || passSt.ibFmt !== ifmt || passSt.ibOff !== S.ib.offset) { pass.setIndexBuffer(ib.gpu, ifmt, S.ib.offset); ibSets++; passSt.ib = ib.gpu; passSt.ibFmt = ifmt; passSt.ibOff = S.ib.offset; }
 		usedInEncoder.add(ib);
 	}
 	// dynamic state
@@ -3186,7 +3189,7 @@ function beginOcclusionInPass() {
 	if (occlusion.next >= occlusion.capacity) { logOnce('qfull', 'occlusion query set exhausted'); return; }
 	occlusion.passSlot = occlusion.next++;
 	q.slots.push(occlusion.passSlot);
-	pass.beginOcclusionQuery(occlusion.passSlot);
+	pass.beginOcclusionQuery(occlusion.passSlot); occqN++;
 }
 function endOcclusionInPass() {
 	if (pass && occlusion.passSlot >= 0) { pass.endOcclusionQuery(); occlusion.passSlot = -1; }
@@ -4012,7 +4015,7 @@ async function present(id) {
 				staged: (stagedUploads + renamedBuffers - ov.staged) / n, cpDef: (copiesDeferred - ov.cpDef) / n, cpSplit: (copySplits - ov.cpSplit) / n, mips: (mipPassesRun - ov.mips) / n, mipsSkipped: (mipSkipped - ov.mipsSkipped) / n,
 				passDraw: (passDrawN - ov.passDraw) / n, passProxy: (passProxyN - ov.passProxy) / n, passClear: (passClearN - ov.passClear) / n,
 				cmds: (commandsRun - ov.cmds) / n, fxSkipped: (fxSkipped - ov.fxSkipped) / n, skipFx: SKIP_FX.join(','),
-				segs: [...segAgg].sort((a, b) => b[1].ms - a[1].ms).slice(0, 5).map(([r, e]) => [r, e.ms / n, e.n / n, e.p / n, e.d / n, e.pl / n, e.bg / n]),
+				segs: [...segAgg].sort((a, b) => b[1].ms - a[1].ms).slice(0, 5).map(([r, e]) => [r, e.ms / n, e.n / n, e.p / n, e.d / n, e.pl / n, e.bg / n, e.rb / n / 1048576, e.vb / n, e.ib / n, e.ind / n, e.oq / n, e.up / n / 1048576]),
 				passTop: [...passHist].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k2, c]) => [k2, c / n]), depthLoads: depthLoadVariants,
 				// what the game sat waiting for (ms a frame this worker was idle with each kind of GPU answer outstanding), read-backs a frame and how long each took
 				waitRb: (waitedOn.readback - ov.wRb) / n, waitOcc: (waitedOn.occlusion - ov.wOcc) / n, waitFence: (waitedOn.fence - ov.wFence) / n,
@@ -4149,10 +4152,10 @@ async function runCommands(tail, head) {
 			const sz = u32[p + 2], big = sz >= 65536, t0 = big ? performance.now() : 0;
 			uploadBuffer(u32[p], u32[p + 1], sz, (p + 3) * 4, op === 47);
 			if (big) fr.up += performance.now() - t0;
-			fr.upBytes += sz;
+			fr.upBytes += sz; upAll += sz;
 			break;
 		}
-		case 13 /* UPLOAD_TEXTURE */: { const t0 = performance.now(); fr.upBytes += u32[p + 11]; uploadTexture(u32[p], u32[p + 1], u32[p + 2], u32[p + 3], u32[p + 4], u32[p + 5], u32[p + 6], u32[p + 7], u32[p + 8], u32[p + 9], u32[p + 10], u32[p + 11], (p + 12) * 4); fr.up += performance.now() - t0; break; }
+		case 13 /* UPLOAD_TEXTURE */: { const t0 = performance.now(); fr.upBytes += u32[p + 11]; upAll += u32[p + 11]; uploadTexture(u32[p], u32[p + 1], u32[p + 2], u32[p + 3], u32[p + 4], u32[p + 5], u32[p + 6], u32[p + 7], u32[p + 8], u32[p + 9], u32[p + 10], u32[p + 11], (p + 12) * 4); fr.up += performance.now() - t0; break; }
 		case 14 /* CREATE_SHADER */: createShader(p, n); break;
 		case 15 /* CREATE_LAYOUT */: createLayout(p); break;
 		case 16 /* CREATE_STATE */: createState(p, n); break;
