@@ -1,0 +1,47 @@
+# Copies this repository to another GitHub repository: every push to main, or by hand
+# (Actions tab > "Copy to another repository" > Run workflow).
+#
+# One-time setup, in THIS repository's Settings:
+#  1. Secrets and variables > Actions > Variables > New repository variable:
+#       COPY_TO_REPO = owner/name of the repository to copy into (it must already exist)
+#  2. Secrets and variables > Actions > Secrets > New repository secret:
+#       COPY_TO_TOKEN = a personal access token that can push to that repository
+#       (github.com/settings/personal-access-tokens: fine-grained, only that repository,
+#        "Contents: Read and write"; add "Workflows: Read and write" too, because this file is copied along)
+#
+# The target's main branch and tags are overwritten with this repository's: anything committed
+# only there is lost. Leave COPY_TO_REPO unset to turn the copying off.
+name: Copy to another repository
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: copy-to-repo
+  cancel-in-progress: true
+
+jobs:
+  copy:
+    runs-on: ubuntu-latest
+    if: ${{ vars.COPY_TO_REPO != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Push main and tags to the other repository
+        env:
+          TARGET: ${{ vars.COPY_TO_REPO }}
+          TOKEN: ${{ secrets.COPY_TO_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::The COPY_TO_TOKEN secret is not set (see the top of this file)."
+            exit 1
+          fi
+          git remote add target "https://x-access-token:${TOKEN}@github.com/${TARGET}.git"
+          git push --force target HEAD:refs/heads/main
+          git push --force --tags target
+          echo "Copied $(git rev-parse --short HEAD) to https://github.com/${TARGET}"
