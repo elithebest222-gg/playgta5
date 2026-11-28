@@ -549,8 +549,8 @@ const LOW_ARGS = () => ['-textureQuality=0', '-pedVariety=0', '-vehicleVariety=0
 // Fastest, Fast and Balanced differ only in resolution: the same lowest world, effects off (EFFECTS_OFF) and reflections redrawn every 30th frame (wgpu_worker.js REFLECT_EVERY).
 // On a 4-thread Chromebook (Intel N100) the frame time is set mostly by the number of draws (~1,100 at the lowest settings), not by pixels: resolution buys some frames, not all.
 const QUALITY = {
-	fastest: { label: 'Fastest', scale: 0.5, cap: [960, 540], args: LOW_ARGS, reflect: 60, effectsOff: true, chunk: '60,8,30', occl: true, fpsGoal: 50, aheadPlay: 0, skipFx: 'grass_fur',
-		about: '50 % resolution, the lowest world and effects, no furry lawn grass; buildings and props drawn within 60 m of you (down to 30 m while the game is slow, more when there is room), small things only up close (car wheels too), nothing that is hidden behind a building or a hill. People and cars are always drawn. For the weakest graphics chips, such as an Intel N100 Chromebook.' },
+	fastest: { label: 'Fastest', scale: 0.5, cap: [640, 360], args: LOW_ARGS, reflect: 60, effectsOff: true, chunk: '60,8,30', occl: true, fpsGoal: 50, aheadPlay: 0, skipFx: 'grass_fur',
+		about: '360p at most (640x360; half the width and height of the window, a quarter of its pixels), the lowest world and effects, no furry lawn grass; buildings and props drawn within 60 m of you (down to 30 m while the game is slow, more when there is room), small things only up close (car wheels too), nothing that is hidden behind a building or a hill. People and cars are always drawn. For the weakest graphics chips, such as an Intel N100 Chromebook.' },
 	fast: { label: 'Fast', scale: 0.45, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '120,4', occl: true, fpsGoal: 40, aheadPlay: 0,
 		about: '45 % resolution, the lowest world and effects; buildings and props drawn within 120 m of you (40 to 240 m, following the frame rate), small things only up close, nothing that is hidden behind a building.' },
 	balanced: { label: 'Balanced', scale: 0.58, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '200,3', occl: true, fpsGoal: 30,
@@ -638,7 +638,8 @@ function startEngine(local) {
 		let w = innerWidth * devicePixelRatio * sc, h = innerHeight * devicePixelRatio * sc;
 		const cap = lowMemory ? [Math.min(2560, preset.cap[0]), Math.min(1440, preset.cap[1])] : preset.cap, k = Math.min(1, cap[0] / w, cap[1] / h);
 		w *= k; h *= k;
-		return [Math.max(320, Math.round(w / 2) * 2), Math.max(240, Math.round(h / 2) * 2)];
+		const up = Math.max(1, 320 / w, 180 / h);		// at least 320x180, keeping the window's shape
+		return [Math.round(w * up / 2) * 2, Math.round(h * up / 2) * 2];
 	};
 	startSize = wantSize();
 	// Script and replay channels: ~87 % of all log lines in play (the scripts print leaderboard and status lines every few frames). Below warning they are off: formatting, the
