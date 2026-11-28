@@ -252,7 +252,16 @@ let passSt = newPassSt();
 let encEpoch = 1, submits = 0, submits0 = 0;
 const usedInEncoder = { add(o) { if (o) o.enc = encEpoch; }, has(o) { return !!o && o.enc === encEpoch; }, clear() { encEpoch++; } };
 const flushReasons = new Map(), ovReasons = new Map();		// submits per reason since the last fps line / the overlay's last report
-let passesBegun = 0, passDrawN = 0, passProxyN = 0, passClearN = 0, commandsRun = 0;		// all passes; those for draws (ensurePass), depth/float copies (proxies), clears of their own
+let passesBegun = 0, passDrawN = 0, passProxyN = 0, passClearN = 0, commandsRun = 0;
+// the drawing passes of the frames since the overlay's last report, by the effect of their first draw and their target ('deferred_lighting > rgba16float 684x384'):
+// which of the game's steps make the most passes (each costs Chrome's GPU process ~1 ms on an N100 Chromebook)
+const passHist = new Map();
+let passToName = null;
+function namePass(prog) {
+	const l = prog.label || '?', k = l.indexOf('::'), e = k > 0 ? l.slice(0, k) : l, r = passInfo.rtInfo && passInfo.rtInfo[0];
+	const key = e + ' > ' + (r ? r.format.replace('float', 'f').replace('unorm', '') : 'depth') + ' ' + passInfo.width + 'x' + passInfo.height + (passInfo.colorCount > 1 ? ' x' + passInfo.colorCount : '');
+	passHist.set(key, (passHist.get(key) || 0) + 1);
+}		// all passes; those for draws (ensurePass), depth/float copies (proxies), clears of their own
 function flush(reason) {
 	const tf0 = performance.now();
 	if (encoder || pass) { const r = reason || 'other'; flushReasons.set(r, (flushReasons.get(r) || 0) + 1); ovReasons.set(r, (ovReasons.get(r) || 0) + 1); }
@@ -666,6 +675,70 @@ function fitVariant(obj, prog, f, mask) {
 	return v;
 }
 const STAGE_NAME = ['vs', 'ps', 'cs'];
+
+// ---- depth sampled with textureSample: a variant that loads it ------------------------------------------------------------------------------------------
+// A shader that samples (textureSample*) a float texture the game binds a depth buffer to needed a float copy of the depth first (depthProxy: a render pass each time the
+// depth changed, and the pass it interrupted begun again; an N100 Chromebook's overlay: 5 copies a frame, with ~58 passes setting the frame time at ~1 ms each in Chrome's
+// GPU process). The game samples depth point-wise at pixel centres (filtering depth means nothing): the variant reads it with textureLoad at the texel the coordinates fall
+// in (plus the call's offset, clamped to the edge, level 0). The binding is then load-only, so the depth is bound as it is (DEPTH_DIRECT): no copy, no interrupted pass.
+// Only 2D bindings read with textureSample / Level / Bias / Grad (with or without an offset); anything else (gathers, arrays) keeps the copy.
+function sampleToLoad(text, b) {		// the text with every sample of binding b a load, or null when some use of b cannot be
+	const re = new RegExp('\\b(textureSample(?:Level|Bias|Grad)?)\\s*\\(\\s*' + b.name + '\\b', 'g');
+	let out = '', last = 0, m, n = 0;
+	while ((m = re.exec(text))) {
+		const a = wgslArgs(text, text.indexOf('(', m.index));
+		if (!a) return null;
+		const fn = m[1], L = a.list, base = fn === 'textureSample' ? 3 : fn === 'textureSampleGrad' ? 5 : 4;		// (t, s, uv), (t, s, uv, level|bias), (t, s, uv, dx, dy), each + offset
+		if (L.length !== base && L.length !== base + 1) return null;
+		out += text.slice(last, m.index) + '_dload_' + b.name + '(' + L[2] + ', ' + (L.length > base ? L[base] : 'vec2<i32>(0)') + ')';
+		last = a.end; re.lastIndex = a.end; n++;
+	}
+	if (!n) return null;
+	text = out + text.slice(last) + '\nfn _dload_' + b.name + '(uv : vec2<f32>, o : vec2<i32>) -> vec4<f32> {\n  let d = vec2<i32>(textureDimensions(' + b.name + ', 0));\n' +
+		'  return textureLoad(' + b.name + ', clamp(vec2<i32>(floor(uv * vec2<f32>(d))) + o, vec2<i32>(0), d - vec2<i32>(1)), 0);\n}\n';
+	// every other mention a load or a size query now (parseWgsl's load-only test)
+	const all = text.match(new RegExp('\\b' + b.name + '\\b', 'g')) || [];
+	const loads = text.match(new RegExp('\\b(?:textureLoad|textureDimensions|textureNumLevels|textureNumLayers)\\s*\\(\\s*' + b.name + '\\b', 'g')) || [];
+	return loads.length === all.length - 1 ? text : null;
+}
+function depthLoadVariant(obj, prog, bs) {
+	const key = 'dl' + bs.map((b) => b.binding).join(',');
+	const cache = prog.dlVariants || (prog.dlVariants = new Map());
+	if (cache.has(key)) return cache.get(key);
+	let text = prog.text;
+	for (const b of bs) if (text) text = sampleToLoad(text, b);
+	let v = null;
+	if (text) {
+		const bindings = prog.info.bindings.map((x) => (bs.includes(x) ? Object.assign({}, x, { loadOnly: true }) : x)), groupBindings = {};
+		for (const x of bindings) (groupBindings[x.group] || (groupBindings[x.group] = [])).push(x);
+		for (const g in groupBindings) groupBindings[g].sort((a, b) => a.binding - b.binding);
+		const label = prog.label + ' (depth loaded: t' + bs.map((b) => b.binding - 32).join(',t') + ')';
+		shaderModuleCount++;
+		const vprog = { module: device.createShaderModule({ code: text, label }), info: { ...prog.info, bindings }, consts: prog.consts, pack: prog.pack, text, flat: prog.flat, groupBindings,
+			variants: new Map(), bgls: [], label, vid: prog.vid, iid: prog.iid, overTex: prog.overTex };
+		v = { obj: { kind: 'shader', stage: obj.stage, hash: obj.hash + '~' + key, sig: obj.sig, program: vprog, fetched: obj.fetched, variantOf: obj }, prog: vprog };
+		depthLoadVariants++;
+	} else logOnce('dl' + prog.label, 'shader ' + prog.label + ' reads a depth buffer in a way that cannot become a load: it keeps the copy');
+	cache.set(key, v);
+	return v;
+}
+// the variant of program prog (shader obj, at stage) for the depth buffers bound now to its sampled float bindings, or null (none bound, or no variant possible);
+// worked out again only when the stage's bindings change
+function depthLoadFor(obj, prog, stage) {
+	const cands = prog.dlCand || (prog.dlCand = prog.info.bindings.filter((b) => b.kind === 'texture' && b.sample === 'float' && !b.loadOnly && !b.ms && b.dim === '2d'));
+	if (!cands.length) return null;
+	if (prog.dlEpoch === bindEpoch[stage] && prog.dlG === gEpoch) return prog.dlLast;
+	let sel = null;
+	const srvs = S.srv[stage];
+	for (const b of cands) {
+		const id = srvs[b.binding - 32], srv = id ? objs.get(id) : null, t = srv && !srv.isBuf ? objs.get(srv.res) : null;
+		if (t && t.kind === 'texture' && isDepth(t.format) && srv.fmt !== 47 && srv.fmt !== 22) (sel || (sel = [])).push(b);
+	}
+	const v = sel ? depthLoadVariant(obj, prog, sel) : null;
+	prog.dlEpoch = bindEpoch[stage]; prog.dlG = gEpoch; prog.dlLast = v;
+	return v;
+}
+let depthLoadVariants = 0, lastDlVs = null, lastDlPs = null;
 
 // ---- D3D's NaN rules for min / max / clamp / saturate ---------------------------------------------------------------------------------------------------------
 // In D3D10+ a NaN operand of min/max yields the other operand (IEEE 754-2008 minNum/maxNum) and saturate(NaN) is 0: shaders rely on that to clean up NaN (a normal
@@ -2414,6 +2487,7 @@ function ensurePass() {
 	// those set nothing. Every call costs twice on a Chromebook (packed here, executed in Chrome's GPU process): these four were set at the start of every pass.
 	passSt = newPassSt();
 	passSt.vp = [0, 0, passW, passH, 0, 1]; passSt.sc = [0, 0, passW, passH]; passSt.bf = [0, 0, 0, 0]; passSt.sref = 0;
+	passToName = passInfo;		// the overlay's passes by what starts them: named by its first draw (doDraw)
 	return true;
 }
 let passInfo = null;
@@ -2706,6 +2780,13 @@ function doDraw(p) {
 	if (!vsProg || (psObj && !psProg)) { skipDraw('if (!vsProg || (psObj && !psProg)) { skippedDraws++; return;'); return; }
 	if (SKIP_FX.length && psProg && skipFxOf(psProg)) { fxSkipped++; return; }		// an effect left out altogether (SKIP_FX)
 	if ((CHUNK.dist > 0 || CHUNK.tiny > 0 || OCCL) && kind < 4) { const c = chunkCull(vsProg, psProg, inst); if (c) { if (c === 1) chunkCulled++; else occlCulled++; return; } }		// too far, too small or hidden
+	if (DEPTH_DIRECT) {		// a depth buffer sampled with textureSample: the variant that loads it (depthLoadFor), so it is bound as it is, with no copy pass
+		const dv = depthLoadFor(vsObj, vsProg, 0), dp = psProg ? depthLoadFor(psObj, psProg, 1) : null;
+		if (dv) { vsObj = dv.obj; vsProg = dv.prog; }
+		if (dp) { psObj = dp.obj; psProg = dp.prog; }
+		const a = dv && dv.obj, b = dp && dp.obj;
+		if (lastDlVs !== a || lastDlPs !== b) { lastDlVs = a; lastDlPs = b; pdirty = true; }
+	}
 	if (vsProg.overTex || (psProg && psProg.overTex)) {		// more textures than this device allows per stage: a variant for the textures bound now (fitTextures)
 		const vv = vsProg.overTex ? fitTextures(vsObj, vsProg, 0) : null, pv = psProg && psProg.overTex ? fitTextures(psObj, psProg, 1) : null;
 		if ((vsProg.overTex && !vv) || (psProg && psProg.overTex && !pv)) { skipDraw('texture limit'); return; }
@@ -2718,6 +2799,7 @@ function doDraw(p) {
 	prepareDepthProxies(vsProg, 0);
 	if (psProg) prepareDepthProxies(psProg, 1);
 	if (!ensurePass()) { skipDraw('if (!ensurePass()) { skippedDraws++; return; }'); return; }
+	if (passToName === passInfo) { passToName = null; namePass(psProg || vsProg); }
 	let pl;
 	if (!pdirty && lastPl && lastPlPass === passInfo) pl = lastPl;
 	else {
@@ -3873,7 +3955,7 @@ async function present(id) {
 		const tn = performance.now();
 		if (!fpsChannel) { fpsChannel = new BroadcastChannel('game-fps'); fpsChannel.onmessage = (e) => { if (e.data && e.data.overlay !== undefined) overlayOn = !!e.data.overlay; }; }
 		fpsOverlayN++;
-		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.mips = mipPassesRun; ov.passDraw = passDrawN; ov.cmds = commandsRun; ov.fxSkipped = fxSkipped; ov.wRb = waitedOn.readback; ov.wOcc = waitedOn.occlusion; ov.wFence = waitedOn.fence; ov.rbN = readbacksDone; ov.rbMs = readbackMs; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear(); for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
+		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.mips = mipPassesRun; ov.passDraw = passDrawN; passHist.clear(); ov.cmds = commandsRun; ov.fxSkipped = fxSkipped; ov.wRb = waitedOn.readback; ov.wOcc = waitedOn.occlusion; ov.wFence = waitedOn.fence; ov.rbN = readbacksDone; ov.rbMs = readbackMs; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear(); for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
 		else if (tn - fpsOverlayT >= 500) {
 			const n = Math.max(1, fpsOverlayN), ms = (tn - fpsOverlayT) / n, busy = gpuBusyMs(tn), gpuPer = (busy - ov.gpu) / n;
 			const byEffect = new Map();
@@ -3890,13 +3972,14 @@ async function present(id) {
 				staged: (stagedUploads + renamedBuffers - ov.staged) / n, mips: (mipPassesRun - ov.mips) / n, mipsSkipped: (mipSkipped - ov.mipsSkipped) / n,
 				passDraw: (passDrawN - ov.passDraw) / n, passProxy: (passProxyN - ov.passProxy) / n, passClear: (passClearN - ov.passClear) / n,
 				cmds: (commandsRun - ov.cmds) / n, fxSkipped: (fxSkipped - ov.fxSkipped) / n, skipFx: SKIP_FX.join(','),
+				passTop: [...passHist].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k2, c]) => [k2, c / n]), depthLoads: depthLoadVariants,
 				// what the game sat waiting for (ms a frame this worker was idle with each kind of GPU answer outstanding), read-backs a frame and how long each took
 				waitRb: (waitedOn.readback - ov.wRb) / n, waitOcc: (waitedOn.occlusion - ov.wOcc) / n, waitFence: (waitedOn.fence - ov.wFence) / n,
 				rbs: (readbacksDone - ov.rbN) / n, rbMs: readbacksDone > ov.rbN ? (readbackMs - ov.rbMs) / (readbacksDone - ov.rbN) : 0, fencesAtSubmit: FENCES_AT_SUBMIT,
 				kept: KEPT_WHY.map((k, i) => [k, (keptWhy[i] - ov.kept[i]) / n]).filter((x) => x[1] >= 1).sort((a, b) => b[1] - a[1]).slice(0, 4), bgs: (bgCreated - ov.bgs) / n, mb: ov.upBytes / n / 1048576,
 				// shader modules and pipelines made per second: each is compiled by Chrome's GPU process (shown there only as "GPU busy"), many while new places stream in
 				newShaders: (shaderModuleCount - ov.mods) * 1000 / (tn - fpsOverlayT), newPipelines: (pipeCreates + aheadMade - ov.pipes) * 1000 / (tn - fpsOverlayT) });
-			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.mips = mipPassesRun; ov.passDraw = passDrawN; ov.cmds = commandsRun; ov.fxSkipped = fxSkipped; ov.wRb = waitedOn.readback; ov.wOcc = waitedOn.occlusion; ov.wFence = waitedOn.fence; ov.rbN = readbacksDone; ov.rbMs = readbackMs; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear();
+			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.mips = mipPassesRun; ov.passDraw = passDrawN; passHist.clear(); ov.cmds = commandsRun; ov.fxSkipped = fxSkipped; ov.wRb = waitedOn.readback; ov.wOcc = waitedOn.occlusion; ov.wFence = waitedOn.fence; ov.rbN = readbacksDone; ov.rbMs = readbackMs; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear();
 			fpsOverlayN = 0; fpsOverlayT = tn; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = busy; ov.draws = drawCount;
 		}
 	}
