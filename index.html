@@ -475,7 +475,7 @@ function fpsDetail(d) {
 	// the passes by what they are for: drawing, mipmaps (and how many were skipped: the picture had not changed), depth/float copies for shaders that read them, clears
 	const kinds = d.passDraw === undefined ? '' : [f1(d.passDraw) + ' drawing', d.mips >= 0.1 && f1(d.mips) + ' mipmap', d.passProxy >= 0.1 && f1(d.passProxy) + ' depth copies', d.passClear >= 0.1 && f1(d.passClear) + ' clears'].filter(Boolean).join(', ');
 	const handed = d.passes === undefined ? '' : 'per frame: ' + f1(d.passes) + ' passes' + (kinds ? ' (' + kinds + ')' : '') + (d.mipsSkipped >= 0.5 ? ' · ' + f1(d.mipsSkipped) + ' mipmap passes skipped' : '') + ' · ' + f1(d.submits) + ' submits' + (d.why && d.why.length ? ' (' + d.why.map((x) => x[0] + ' ' + f1(x[1])).join(', ') + ')' : '') +
-		(d.staged >= 0.1 ? ' · ' + f1(d.staged) + ' updates copied in place' : '') + (d.cpDef >= 0.1 ? ' (' + f1(d.cpDef) + ' held to the pass end, ' + f1(d.cpSplit || 0) + ' split a pass)' : '') + ' · ' + f1(d.bgs || 0) + ' bind groups made · ' + f1(d.mb || 0) + ' MB uploaded' + (d.cmds >= 1 ? ' · ' + Math.round(d.cmds) + ' game commands' : '');
+		(d.staged >= 0.1 ? ' · ' + f1(d.staged) + ' updates copied in place' : '') + (d.cpDef >= 0.1 ? ' (' + f1(d.cpDef) + ' held to the pass end, ' + f1(d.cpSplit || 0) + ' split a pass)' : '') + (d.rbReuse >= 0.1 ? ' · ' + f1(d.rbReuse) + ' read-backs reused' : '') + ' · ' + f1(d.bgs || 0) + ' bind groups made · ' + f1(d.mb || 0) + ' MB uploaded' + (d.cmds >= 1 ? ' · ' + Math.round(d.cmds) + ' game commands' : '');
 	// what the draws are (the shader effect: ped, vehicle_*, trees*, normal*... = buildings and props, im = blits and UI, ...) and the reflection cube map's share
 	const top = (d.top || []).filter((x) => x[1] >= 1).map((x) => x[0] + ' ' + Math.round(x[1])).join(' · ');
 	const refl = (d.refl || 0) + (d.reflSkip || 0) >= 1 ? 'reflections ' + Math.round(d.refl || 0) + ' drawn' + (d.reflSkip >= 1 ? ', ' + Math.round(d.reflSkip) + ' skipped (each face every ' + d.reflEvery + ' frames)' : '') : '';
@@ -557,11 +557,11 @@ const LOW_ARGS = () => ['-textureQuality=0', '-pedVariety=0', '-vehicleVariety=0
 // Fastest, Fast and Balanced differ only in resolution: the same lowest world, effects off (EFFECTS_OFF) and reflections redrawn every 30th frame (wgpu_worker.js REFLECT_EVERY).
 // On a 4-thread Chromebook (Intel N100) the frame time is set mostly by the number of draws (~1,100 at the lowest settings), not by pixels: resolution buys some frames, not all.
 const QUALITY = {
-	fastest: { label: 'Fastest', scale: 0.5, cap: [480, 270], pop: '2,4', args: LOW_ARGS, reflect: 60, effectsOff: true, chunk: '60,8,30', occl: true, fpsGoal: 50, aheadPlay: 0, skipFx: 'grass,trees_lod,trees_camera_aligned,cable,decal_dirt,decal_glue,decal_shadow_only,ped_decal',
+	fastest: { label: 'Fastest', scale: 0.5, cap: [480, 270], pop: '2,4', rbEvery: 4, args: LOW_ARGS, reflect: 60, effectsOff: true, chunk: '60,8,30', occl: true, fpsGoal: 50, aheadPlay: 0, skipFx: 'grass,trees_lod,trees_camera_aligned,cable,decal_dirt,decal_glue,decal_shadow_only,ped_decal',
 		about: '270p at most (480x270; half the width and height of the window at most), at most 2 passers-by and 4 traffic cars around you (mission characters and cars are not affected), no grass, no far-away (still) trees, no power cables, dirt decals or blood on people, the lowest world and effects; buildings and props drawn within 60 m of you (down to 30 m while the game is slow, more when there is room), small things only up close (car wheels too), nothing that is hidden behind a building or a hill. People and cars are always drawn. For the weakest graphics chips, such as an Intel N100 Chromebook.' },
-	fast: { label: 'Fast', scale: 0.45, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '120,4', occl: true, fpsGoal: 40, aheadPlay: 0, pop: '2,4',
+	fast: { label: 'Fast', scale: 0.45, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '120,4', occl: true, fpsGoal: 40, aheadPlay: 0, pop: '2,4', rbEvery: 4,
 		about: '45 % resolution, the lowest world and effects; buildings and props drawn within 120 m of you (40 to 240 m, following the frame rate), small things only up close, nothing that is hidden behind a building.' },
-	balanced: { label: 'Balanced', scale: 0.58, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '200,3', occl: true, fpsGoal: 30, pop: '2,4',
+	balanced: { label: 'Balanced', scale: 0.58, cap: [1280, 720], args: LOW_ARGS, reflect: 30, effectsOff: true, chunk: '200,3', occl: true, fpsGoal: 30, pop: '2,4', rbEvery: 4,
 		about: '58 % resolution. Buildings and props drawn within 200 m of you (the ground stays to the horizon; large buildings and roads count from their nearest part), tiny far-away things and whatever is hidden behind buildings left out, the distance following the frame rate to keep about 30 frames per second. No shadows, ambient occlusion, depth of field, motion blur or anti-aliasing; reflections redrawn every 30th frame; fewest people and cars, lower texture detail. For Chromebooks and laptops.' },
 	full: { label: 'Full', scale: 1, cap: [3840, 2160], args: () => [], reflect: 1, effectsOff: false, chunk: '0', occl: false,
 		about: 'Native resolution and the game\'s own settings (effects the other presets turned off come back). For gaming PCs.' },
@@ -704,7 +704,8 @@ function startEngine(local) {
 		// occlusion (wgpu_worker.js OCCL): what an earlier frame's depth shows hidden behind other things is not drawn; ?occl=0 / ?occl=1 turns it off / on
 		occl: q.get('occl') !== null ? q.get('occl') === '1' : !!preset.occl,
 		// shader effects left out altogether (wgpu_worker.js SKIP_FX, by effect-name prefix): Fastest drops all grass, the far (LOD, billboard) trees that never move, power cables, dirt/glue/shadow decals and blood or dirt on people; ?skipfx= sets the list, ?skipfx=none drops nothing
-		pop: popWanted,		// ?pop=2,4: at most 2 passers-by and 4 traffic cars (io_worker.js popcycle.dat); ?pop=0 the game's own numbers
+		pop: popWanted,
+		rbEvery: +(q.get('rbevery') || preset.rbEvery || 1),		// ?rbevery=1: every read-back fetched fresh		// ?pop=2,4: at most 2 passers-by and 4 traffic cars (io_worker.js popcycle.dat); ?pop=0 the game's own numbers
 		skipFx: q.get('skipfx') !== null ? (q.get('skipfx') === 'none' ? '' : q.get('skipfx')) : preset.skipFx || '',
 		// the draw distance follows the frame rate (wgpu_worker.js CHUNK_AUTO): the target frame time in ms; ?fpsgoal=0 keeps it fixed, ?fpsgoal=45 aims at 45 fps
 		chunkAuto: ((g) => (g > 0 ? 1000 / g : 0))(q.get('fpsgoal') !== null ? +q.get('fpsgoal') : preset.fpsGoal || 0),
