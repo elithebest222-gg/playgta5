@@ -278,6 +278,22 @@ function namePass(prog) {
 	const key = e + ' > ' + (r ? r.format.replace('float', 'f').replace('unorm', '') : 'depth') + ' ' + passInfo.width + 'x' + passInfo.height + (passInfo.colorCount > 1 ? ' x' + passInfo.colorCount : '');
 	passHist.set(key, (passHist.get(key) || 0) + 1);
 }		// all passes; those for draws (ensurePass), depth/float copies (proxies), clears of their own
+// The graphics side's time by part of the frame (overlay only): each submit's work, from when it was handed over (or the previous part finished) until Chrome reports it done,
+// summed per submit reason with what it held (drawing passes, draws, pipeline switches, bind group changes). Chrome's GPU process takes 80-90 ms a frame on an N100
+// Chromebook while a frame of the same shape in probe.html takes 11 ms: this names the part where the time goes.
+const segAgg = new Map();
+let segLastDone = 0, segP0 = 0, segD0 = 0, segPl0 = 0, segBg0 = 0, plSets = 0, bgSets = 0;
+function segTrack(reason) {
+	const t = performance.now(), e0 = { p: passDrawN - segP0, d: drawCount - segD0, pl: plSets - segPl0, bg: bgSets - segBg0 };
+	segP0 = passDrawN; segD0 = drawCount; segPl0 = plSets; segBg0 = bgSets;
+	device.queue.onSubmittedWorkDone().then(() => {
+		const done = performance.now(), ms = done - Math.max(t, segLastDone);
+		segLastDone = done;
+		let e = segAgg.get(reason);
+		if (!e) segAgg.set(reason, e = { ms: 0, n: 0, p: 0, d: 0, pl: 0, bg: 0 });
+		e.ms += ms; e.n++; e.p += e0.p; e.d += e0.d; e.pl += e0.pl; e.bg += e0.bg;
+	});
+}
 function flush(reason) {
 	const tf0 = performance.now();
 	if (encoder || pass) { const r = reason || 'other'; flushReasons.set(r, (flushReasons.get(r) || 0) + 1); ovReasons.set(r, (ovReasons.get(r) || 0) + 1); }
@@ -285,7 +301,7 @@ function flush(reason) {
 	if (dirtyChunks.size) flushUniforms();
 	const resolves = pendingResolve.length ? recordResolves() : null;		// into this encoder: no command buffer of its own
 	const boxes = boxRequests.length ? boxEncode(getEncoder()) : null;		// vertex buffers whose boxes are read back (draw distance)
-	if (encoder) { device.queue.submit([encoder.finish()]); encoder = null; onSubmitted(); submits++; counterSlot = 0; if (!isNode) gpuTrack(); }
+	if (encoder) { device.queue.submit([encoder.finish()]); encoder = null; onSubmitted(); submits++; counterSlot = 0; if (!isNode) { gpuTrack(); if (overlayOn) segTrack(reason || 'other'); } }
 	upStage.off = 0;		// staging writes from now on land after this submit's copies
 	if (renameRetired.length) renameRelease();
 	if (deferredDestroys.length) { for (const g of deferredDestroys) g.destroy(); deferredDestroys = []; }
@@ -2828,7 +2844,7 @@ function doDraw(p) {
 		lastPl = pl; lastPlPass = passInfo; pdirty = false;
 	}
 	if (!pl) { skipDraw('if (!pl) { skippedDraws++; return; }'); return; }
-	if (passSt.pl !== pl) { pass.setPipeline(pl); passSt.pl = pl; }
+	if (passSt.pl !== pl) { pass.setPipeline(pl); passSt.pl = pl; plSets++; }
 	if (dbgIdx && dbgLimit >= 0 && dbgFrameDraw === dbgLimit) {
 		const t0 = passInfo.rtInfo && passInfo.rtInfo[0];
 		dbgLastLabel = '#' + (dbgFrameDraw - 1) + ' ' + (pl.label || '?') + ' target ' + (t0 ? t0.format : 'depth only') + ' ' + passInfo.width + 'x' + passInfo.height + ' n=' + count + (inst > 1 ? ' x' + inst : '');
@@ -2838,8 +2854,8 @@ function doDraw(p) {
 	const g1 = psProg && psProg.groupBindings[1] ? stageBG(1, psProg, 1) : null;
 	if (vsProg.groupBindings[0] && !g0) { skipDraw('if (vsProg.groupBindings[0] && !g0) { skippedDraws++; return'); return; }
 	if (psProg && psProg.groupBindings[1] && !g1) { skipDraw('if (psProg && psProg.groupBindings[1] && !g1) { skippedDraws'); return; }
-	if (g0) { const d = g0.dyn.length ? g0.dyn[0] : -1; if (passSt.bg0 !== g0.bg || passSt.dyn0 !== d) { setBG(pass, 0, g0); passSt.bg0 = g0.bg; passSt.dyn0 = d; } }
-	if (g1) { const d = g1.dyn.length ? g1.dyn[0] : -1; if (passSt.bg1 !== g1.bg || passSt.dyn1 !== d) { setBG(pass, 1, g1); passSt.bg1 = g1.bg; passSt.dyn1 = d; } }
+	if (g0) { const d = g0.dyn.length ? g0.dyn[0] : -1; if (passSt.bg0 !== g0.bg || passSt.dyn0 !== d) { setBG(pass, 0, g0); passSt.bg0 = g0.bg; passSt.dyn0 = d; bgSets++; } }
+	if (g1) { const d = g1.dyn.length ? g1.dyn[0] : -1; if (passSt.bg1 !== g1.bg || passSt.dyn1 !== d) { setBG(pass, 1, g1); passSt.bg1 = g1.bg; passSt.dyn1 = d; bgSets++; } }
 	// vertex / index buffers (baseVertex and startInstance are folded into the buffer offsets: SV_VertexID is zero based)
 	const indexed = kind === 4 || (kind < 4 && (kind & 1) !== 0);
 	// D3D's SV_VertexID / SV_InstanceID do not include the draw's base vertex / start instance (and this port treats StartVertexLocation the same); WebGPU's vertex_index / instance_index
@@ -3979,7 +3995,7 @@ async function present(id) {
 		const tn = performance.now();
 		if (!fpsChannel) { fpsChannel = new BroadcastChannel('game-fps'); fpsChannel.onmessage = (e) => { if (e.data && e.data.overlay !== undefined) overlayOn = !!e.data.overlay; }; }
 		fpsOverlayN++;
-		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.cpDef = copiesDeferred; ov.cpSplit = copySplits; ov.mips = mipPassesRun; ov.passDraw = passDrawN; passHist.clear(); ov.cmds = commandsRun; ov.fxSkipped = fxSkipped; ov.wRb = waitedOn.readback; ov.wOcc = waitedOn.occlusion; ov.wFence = waitedOn.fence; ov.rbN = readbacksDone; ov.rbMs = readbackMs; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear(); for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
+		if (!fpsOverlayT) { fpsOverlayT = tn; fpsOverlayN = 0; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = gpuBusyMs(tn); ov.draws = drawCount; ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.cpDef = copiesDeferred; ov.cpSplit = copySplits; ov.mips = mipPassesRun; ov.passDraw = passDrawN; passHist.clear(); segAgg.clear(); ov.cmds = commandsRun; ov.fxSkipped = fxSkipped; ov.wRb = waitedOn.readback; ov.wOcc = waitedOn.occlusion; ov.wFence = waitedOn.fence; ov.rbN = readbacksDone; ov.rbMs = readbackMs; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear(); for (const pr of ovProgs) pr.ovN = 0; ovProgs.length = 0; }
 		else if (tn - fpsOverlayT >= 500) {
 			const n = Math.max(1, fpsOverlayN), ms = (tn - fpsOverlayT) / n, busy = gpuBusyMs(tn), gpuPer = (busy - ov.gpu) / n;
 			const byEffect = new Map();
@@ -3996,6 +4012,7 @@ async function present(id) {
 				staged: (stagedUploads + renamedBuffers - ov.staged) / n, cpDef: (copiesDeferred - ov.cpDef) / n, cpSplit: (copySplits - ov.cpSplit) / n, mips: (mipPassesRun - ov.mips) / n, mipsSkipped: (mipSkipped - ov.mipsSkipped) / n,
 				passDraw: (passDrawN - ov.passDraw) / n, passProxy: (passProxyN - ov.passProxy) / n, passClear: (passClearN - ov.passClear) / n,
 				cmds: (commandsRun - ov.cmds) / n, fxSkipped: (fxSkipped - ov.fxSkipped) / n, skipFx: SKIP_FX.join(','),
+				segs: [...segAgg].sort((a, b) => b[1].ms - a[1].ms).slice(0, 5).map(([r, e]) => [r, e.ms / n, e.n / n, e.p / n, e.d / n, e.pl / n, e.bg / n]),
 				passTop: [...passHist].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k2, c]) => [k2, c / n]), depthLoads: depthLoadVariants,
 				// what the game sat waiting for (ms a frame this worker was idle with each kind of GPU answer outstanding), read-backs a frame and how long each took
 				waitRb: (waitedOn.readback - ov.wRb) / n, waitOcc: (waitedOn.occlusion - ov.wOcc) / n, waitFence: (waitedOn.fence - ov.wFence) / n,
@@ -4003,7 +4020,7 @@ async function present(id) {
 				kept: KEPT_WHY.map((k, i) => [k, (keptWhy[i] - ov.kept[i]) / n]).filter((x) => x[1] >= 1).sort((a, b) => b[1] - a[1]).slice(0, 4), bgs: (bgCreated - ov.bgs) / n, mb: ov.upBytes / n / 1048576,
 				// shader modules and pipelines made per second: each is compiled by Chrome's GPU process (shown there only as "GPU busy"), many while new places stream in
 				newShaders: (shaderModuleCount - ov.mods) * 1000 / (tn - fpsOverlayT), newPipelines: (pipeCreates + aheadMade - ov.pipes) * 1000 / (tn - fpsOverlayT) });
-			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.cpDef = copiesDeferred; ov.cpSplit = copySplits; ov.mips = mipPassesRun; ov.passDraw = passDrawN; passHist.clear(); ov.cmds = commandsRun; ov.fxSkipped = fxSkipped; ov.wRb = waitedOn.readback; ov.wOcc = waitedOn.occlusion; ov.wFence = waitedOn.fence; ov.rbN = readbacksDone; ov.rbMs = readbackMs; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear();
+			ov.merged = clearsMerged; ov.reused = packsReused; ov.noop = noopDraws; ov.culled = chunkCulled; ov.chunkFrames = chunkFrames; ov.mods = shaderModuleCount; ov.pipes = pipeCreates + aheadMade; ov.sized = chunkSized + chunkUnsized; ov.sizedK = chunkSized; ov.hidden = occlCulled; ov.passes = passesBegun; ov.submits = submits; ov.bgs = bgCreated; ov.staged = stagedUploads + renamedBuffers; ov.cpDef = copiesDeferred; ov.cpSplit = copySplits; ov.mips = mipPassesRun; ov.passDraw = passDrawN; passHist.clear(); segAgg.clear(); ov.cmds = commandsRun; ov.fxSkipped = fxSkipped; ov.wRb = waitedOn.readback; ov.wOcc = waitedOn.occlusion; ov.wFence = waitedOn.fence; ov.rbN = readbacksDone; ov.rbMs = readbackMs; ov.passProxy = passProxyN; ov.passClear = passClearN; ov.mipsSkipped = mipSkipped; ov.kept = keptWhy.slice(); ov.upBytes = 0; ovReasons.clear();
 			fpsOverlayN = 0; fpsOverlayT = tn; ov.idle = ov.wait = ov.pipe = ov.up = ov.refl = ov.reflSkip = 0; ov.gpu = busy; ov.draws = drawCount;
 		}
 	}
