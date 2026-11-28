@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Graphics Cost Probe</title>
+<style>
+	:root { --bg: #111418; --fg: #e8eaed; --dim: #9aa0a6; --ok: #7cc576; --bad: #f28b82; --line: #2a3038; }
+	@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) { --bg: #f6f7f9; --fg: #1d2126; --dim: #5f6368; --ok: #2e7d32; --bad: #c62828; --line: #d5d9de; } }
+	body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, sans-serif; }
+	main { max-width: 760px; margin: 0 auto; padding: 20px 16px 40px; }
+	h1 { font-size: 20px; margin: 0 0 4px; }
+	p { color: var(--dim); margin: 6px 0 14px; }
+	button { font: inherit; padding: 8px 16px; border-radius: 8px; border: 0; background: var(--ok); color: #111; cursor: pointer; }
+	button:disabled { opacity: .5; cursor: default; }
+	table { width: 100%; border-collapse: collapse; margin-top: 14px; font: 13px/1.4 ui-monospace, monospace; }
+	td, th { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+	td.n { text-align: right; white-space: nowrap; }
+	#status { margin-top: 10px; font: 13px ui-monospace, monospace; color: var(--dim); white-space: pre-wrap; }
+	canvas { width: 160px; height: 90px; border: 1px solid var(--line); margin-top: 10px; }
+</style>
+</head>
+<body>
+<main>
+<h1>Graphics cost probe</h1>
+<p>Measures what each kind of WebGPU command costs on this computer (Chrome's GPU process plus the graphics chip), the same kinds the game sends every frame. Close the game tab first, keep the computer plugged in, press Start and leave this tab in front for about a minute. Then take a screenshot of the table.</p>
+<button id="go">Start</button>
+<canvas id="cv" width="480" height="270"></canvas>
+<div id="status"></div>
+<table id="out"><tbody></tbody></table>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const status = (t) => { $('status').textContent = t; };
+const rows = [];
+function row(name, ms, note) {
+	rows.push([name, ms, note]);
+	const tr = document.createElement('tr');
+	tr.innerHTML = '<td></td><td class="n"></td><td></td>';
+	tr.children[0].textContent = name; tr.children[1].textContent = typeof ms === 'number' ? ms.toFixed(ms < 1 ? 3 : 1) + ' ms' : ms; tr.children[2].textContent = note || '';
+	$('out').tBodies[0].appendChild(tr);
+}
+const median = (a) => { const s = a.slice().sort((x, y) => x - y); return s[s.length >> 1]; };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+$('go').onclick = async () => {
+	$('go').disabled = true;
+	try { await run(); status('Done. Take a screenshot of the table (Ctrl + Show windows) and send it.'); }
+	catch (e) { status('Stopped: ' + (e && e.message || e)); }
+};
+
+async function run() {
+	if (!navigator.gpu) throw new Error('no WebGPU in this browser');
+	const adapter = await navigator.gpu.requestAdapter();
+	const device = await adapter.requestDevice();
+	const info = adapter.info || {};
+	row('graphics chip', '', [info.vendor, info.architecture, info.description].filter(Boolean).join(' ') || '?');
+	const W = 480, H = 270, FMT = 'rgba16float';
+	const target = device.createTexture({ size: [W, H], format: FMT, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC });
+	const view = target.createView();
+	const module = device.createShaderModule({ code: `
+		struct U { m: vec4f, c: vec4f }
+		@group(0) @binding(0) var<uniform> u: U;
+		@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(-0.9, -1), vec2f(-1, -0.9)); return vec4f(p[i] + u.m.xy, 0, 1); }
+		@fragment fn fs() -> @location(0) vec4f { return u.c; }` });
+	const bgl = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform', hasDynamicOffset: true } }] });
+	const pipe = device.createRenderPipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }), vertex: { module, entryPoint: 'vs' }, fragment: { module, entryPoint: 'fs', targets: [{ format: FMT }] } });
+	const ubuf = device.createBuffer({ size: 256 * 1024, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+	const bg = device.createBindGroup({ layout: bgl, entries: [{ binding: 0, resource: { buffer: ubuf, size: 32 } }] });
+	const ctx = $('cv').getContext('webgpu');
+	ctx.configure({ device, format: navigator.gpu.getPreferredCanvasFormat(), alphaMode: 'opaque' });
+
+	// one measurement: run `rec(enc)` (records commands, may submit itself), submit, wait until the GPU is done; median of `n` runs, minus the empty round trip
+	async function timeIt(rec, n = 15) {
+		const t = [];
+		for (let i = 0; i < n; i++) {
+			const t0 = performance.now();
+			const enc = device.createCommandEncoder();
+			await rec(enc);
+			device.queue.submit([enc.finish()]);
+			await device.queue.onSubmittedWorkDone();
+			t.push(performance.now() - t0);
+		}
+		return median(t);
+	}
+	const passes = (enc, k, draws) => {
+		for (let p = 0; p < k; p++) {
+			const pass = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: p ? 'load' : 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }] });
+			if (draws) { pass.setPipeline(pipe); for (let d = 0; d < draws; d++) { pass.setBindGroup(0, bg, [(d % 1000) * 256]); pass.draw(3); } }
+			pass.end();
+		}
+	};
+	status('warming up...');
+	await timeIt((e) => passes(e, 4, 10), 5);
+
+	status('1/8 an empty submit');
+	const base = await timeIt(() => {}, 30);
+	row('empty submit, round trip', base, 'the floor of every measurement below (subtracted from them)');
+
+	status('2/8 render passes');
+	const p50 = await timeIt((e) => passes(e, 50, 0));
+	row('render pass (empty)', (p50 - base) / 50, 'each; the game has ~55 a frame');
+
+	status('3/8 draws');
+	const d400 = await timeIt((e) => passes(e, 1, 400));
+	row('draw (+ bind group)', (d400 - base) / 400, 'each; the game has ~250-400 a frame');
+
+	status('4/8 submits');
+	const s6 = await timeIt(async () => { for (let i = 0; i < 6; i++) { const e = device.createCommandEncoder(); passes(e, 1, 1); device.queue.submit([e.finish()]); } });
+	row('submit', (s6 - base) / 6, 'each; the game has ~5-6 a frame');
+
+	status('5/8 read-backs');
+	const rb = [], rbBufs = Array.from({ length: 4 }, () => device.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }));
+	for (let i = 0; i < 10; i++) {
+		const t0 = performance.now();
+		for (const b of rbBufs) { const e = device.createCommandEncoder(); e.copyBufferToBuffer(ubuf, 0, b, 0, 256); device.queue.submit([e.finish()]); await b.mapAsync(GPUMapMode.READ); b.unmap(); }
+		rb.push((performance.now() - t0) / 4);
+	}
+	row('read-back (copy, submit, map, wait)', median(rb), 'each; the game waits for ~4 a frame');
+
+	status('6/8 uploads');
+	const data = new Uint8Array(512 * 1024);
+	const up = await timeIt(() => { for (let i = 0; i < 64; i++) device.queue.writeBuffer(ubuf, (i % 32) * 8192, data, 0, 8192); });
+	row('writeBuffer, 64 x 8 KB', up - base, 'about what the game uploads a frame');
+	const tex = device.createTexture({ size: [256, 256], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+	const tdata = new Uint8Array(256 * 256 * 4);
+	const tw = await timeIt(() => { for (let i = 0; i < 8; i++) device.queue.writeTexture({ texture: tex }, tdata, { bytesPerRow: 1024 }, [256, 256]); });
+	row('writeTexture 256x256, x8', tw - base, '');
+	const tc = await timeIt(() => { for (let i = 0; i < 8; i++) device.createTexture({ size: [256, 256], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST }).destroy(); });
+	row('createTexture + destroy, x8', tc - base, 'textures streamed in and out');
+
+	status('7/8 a game-like frame (55 passes, 400 draws, 6 submits, 4 read-backs, uploads)');
+	const fr = [];
+	for (let i = 0; i < 10; i++) {
+		const t0 = performance.now();
+		for (let s = 0; s < 6; s++) {
+			const e = device.createCommandEncoder();
+			passes(e, s < 5 ? 10 : 5, s === 0 ? 0 : 0);
+			if (s === 1) { const pass = e.beginRenderPass({ colorAttachments: [{ view, loadOp: 'load', storeOp: 'store' }] }); pass.setPipeline(pipe); for (let d = 0; d < 400; d++) { pass.setBindGroup(0, bg, [(d % 1000) * 256]); pass.draw(3); } pass.end(); }
+			for (let k = 0; k < 11; k++) device.queue.writeBuffer(ubuf, k * 8192, data, 0, 8192);
+			device.queue.submit([e.finish()]);
+			if (s < 4) { const b = rbBufs[s]; const c = device.createCommandEncoder(); c.copyBufferToBuffer(ubuf, 0, b, 0, 256); device.queue.submit([c.finish()]); await b.mapAsync(GPUMapMode.READ); b.unmap(); }
+		}
+		await device.queue.onSubmittedWorkDone();
+		fr.push(performance.now() - t0);
+	}
+	row('game-like frame, all of the above', median(fr), 'compare with "GPU busy" in the game\'s = overlay (80-90 ms)');
+	status('8/8 presenting to the page');
+	try {
+	const pr = [];
+	for (let i = 0; i < 20; i++) {
+		await new Promise((r) => requestAnimationFrame(r));
+		const t0 = performance.now();
+		const e = device.createCommandEncoder();
+		const pass = e.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0.1, 0.4, 0.2, 1] }] });
+		pass.end();
+		device.queue.submit([e.finish()]);
+		await device.queue.onSubmittedWorkDone();
+		pr.push(performance.now() - t0);
+	}
+	row('present a canvas frame', median(pr) - base, '');
+	} catch (e) { row('present a canvas frame', 'n/a', 'could not be measured here (' + (e && e.message || e) + ')'); }
+
+	device.destroy();
+}
+</script>
+</body>
+</html>
