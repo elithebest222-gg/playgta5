@@ -574,7 +574,7 @@ function parsePop(s) {
 	return m ? { peds: +m[1], cars: +m[2] } : null;
 }
 function rewritePopcycle(text, cap) {
-	const caps = [cap.peds, 0, cap.cars, cap.cars >> 1, 0, -1, -1, -1, 0, cap.cars >> 1];		// per column; -1: unchanged
+	const caps = [cap.peds, 0, cap.cars, cap.cars >> 1, 0, -1, -1, cap.peds ? 1 : 0, 0, cap.cars >> 1];		// (MaxScenPeds: scenario models streamed in)		// per column; -1: unchanged
 	let lines = 0;
 	const out = text.replace(/^([ \t]+)(\d+(?:[ \t]+\d+){9})(?=[ \t]+peds\b)/gm, (all, lead, nums) => {
 		lines++;
