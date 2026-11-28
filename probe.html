@@ -191,6 +191,29 @@ async function run() {
 		fr.push(performance.now() - t0);
 	}
 	row('game-like frame, all of the above', median(fr), 'compare with "GPU busy" in the game\'s = overlay (80-90 ms)');
+	// the same frame while other threads keep the CPU busy, as the game's own threads do: does Chrome's GPU process then wait for CPU time?
+	const spinSrc = URL.createObjectURL(new Blob(['onmessage = () => { const end = performance.now() + 60000; let x = 0; while (performance.now() < end) x += Math.sqrt(x + 1); postMessage(x); };'], { type: 'text/javascript' }));
+	for (const k of [2, 3, 4]) {
+		status('7/8 the game-like frame with ' + k + ' busy CPU threads');
+		const spinners = Array.from({ length: k }, () => { const w = new Worker(spinSrc); w.postMessage(0); return w; });
+		await sleep(300);
+		const fk = [];
+		for (let i = 0; i < 8; i++) {
+			const t0 = performance.now();
+			for (let s = 0; s < 6; s++) {
+				const e = device.createCommandEncoder();
+				passes(e, s < 5 ? 10 : 5, 0);
+				if (s === 1) { const pass = e.beginRenderPass({ colorAttachments: [{ view, loadOp: 'load', storeOp: 'store' }] }); pass.setPipeline(pipe); for (let d = 0; d < 400; d++) { pass.setBindGroup(0, bg, [(d % 1000) * 256]); pass.draw(3); } pass.end(); }
+				device.queue.submit([e.finish()]);
+				if (s < 4) { const b = rbBufs[s]; const c = device.createCommandEncoder(); c.copyBufferToBuffer(ubuf, 0, b, 0, 256); device.queue.submit([c.finish()]); await b.mapAsync(GPUMapMode.READ); b.unmap(); }
+			}
+			await device.queue.onSubmittedWorkDone();
+			fk.push(performance.now() - t0);
+		}
+		spinners.forEach((w) => w.terminate());
+		row('game-like frame, ' + k + ' CPU threads busy', median(fk), k === 3 ? "like the game: if this is far above the row before, the game's threads starve Chrome" : '');
+		await sleep(300);
+	}
 	status('8/8 presenting to the page');
 	try {
 	const pr = [];
